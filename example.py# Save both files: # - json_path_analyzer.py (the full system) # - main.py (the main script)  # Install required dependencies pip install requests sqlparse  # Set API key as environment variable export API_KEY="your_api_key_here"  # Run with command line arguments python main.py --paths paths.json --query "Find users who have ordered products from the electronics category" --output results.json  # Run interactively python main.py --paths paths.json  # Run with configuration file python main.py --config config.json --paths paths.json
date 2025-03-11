@@ -1,6 +1,0 @@
-ddl_file: "/home/davoud/Spider2/spider2-lite/resource/databases/sqlite/Pagila/DDL.csv"
-db_file: "/home/davoud/Spider2/spider2-lite/resource/databases/spider2-localdb/Pagila.sqlite"
-query: "Please help me find the film category with the highest total rental hours in cities where the city's name either starts with \"A\" or contains a hyphen."
-output_file: "query_paths.json"
-api_url: "http://105.144.47.81:8001/v1/chat/completions"
-model: "llama70b"
