@@ -745,4 +745,50 @@ if __name__ == "__main__":
     main()
 
 # python PathAnalyzer.py  --paths database_schema_paths.json
+# Replace this problematic section:
 paths_match = re.search(r'<RELEVANT_PATHS>(.*?)</RELEVANT_PATHS>', content, re.DOTALL)
+
+paths = []
+relevance_scores = {}
+
+if paths_match:
+    paths_text = paths_match.group(1).strip()
+    # Extract path and score pairs
+    path_score_pairs = re.findall(r'^(.*?):\s*([\d.]+)$', paths_text, re.MULTILINE)
+    
+    for path, score in path_score_pairs:
+        path = path.strip()
+        paths.append(path)
+        relevance_scores[path] = float(score)
+
+# With this more robust version:
+paths = []
+relevance_scores = {}
+
+# Try multiple pattern formats to extract paths
+# First try original tag format
+paths_match = re.search(r'<RELEVANT_PATHS>(.*?)</RELEVANT_PATHS>', content, re.DOTALL)
+if paths_match:
+    paths_text = paths_match.group(1).strip()
+    path_score_pairs = re.findall(r'^(.*?):\s*([\d.]+)$', paths_text, re.MULTILINE)
+    
+    for path, score in path_score_pairs:
+        path = path.strip()
+        paths.append(path)
+        relevance_scores[path] = float(score)
+else:
+    # Try numbered list format: 1. path: score
+    path_score_pairs = re.findall(r'(?:\d+\.|\-)\s*(.*?):\s*([\d.]+)', content)
+    
+    if path_score_pairs:
+        for path, score in path_score_pairs:
+            path = path.strip()
+            paths.append(path)
+            relevance_scores[path] = float(score)
+    else:
+        # Last resort: Extract any paths mentioned in the response
+        for path in paths_data:
+            if path in content:
+                paths.append(path)
+                # Assign decreasing scores by position
+                relevance_scores[path] = max(0.1, 1.0 - 0.1 * len(paths))
