@@ -24,6 +24,11 @@ def main():
     # Parse command line arguments
     args = parse_args()
     
+    # Check if paths file exists
+    if not os.path.exists(args.paths):
+        print(f"Error: Paths file not found: {args.paths}")
+        sys.exit(1)
+    
     # Initialize the query processor
     if args.config and os.path.exists(args.config):
         processor = QueryProcessor.from_config(args.config)
@@ -81,4 +86,7 @@ def print_results(results):
         for i, sql in enumerate(result["top_sqls"]):
             rewards = result["sql_rewards"].get(sql, {})
             print(f"\n  SQL #{i+1}:")
-            print(f"  {sql.replace(chr(10), chr(10)+'  ')
+            print(f"  {sql.replace(chr(10), chr(10)+'  ')}")
+            print("\n  Rewards:")
+            for reward_type, score in rewards.items():
+                print(f"    {reward_type}: {score:.2f}")
