@@ -1,5 +1,5 @@
 """
-flow_diffusion.py - Implementation of the Flow Diffusion algorithm
+flow_diffusion.py - Implementation of the Weighted Flow Diffusion algorithm
 """
 
 import math
@@ -312,4 +312,65 @@ class WeightedFlowDiffusion:
         Extract potential joins from a subcluster.
         
         Args:
-            graph:
+            graph: The schema graph
+            subcluster: Set of node IDs in the subcluster
+            
+        Returns:
+            List of join conditions (table1, col1, table2, col2)
+        """
+        joins = []
+        
+        # Find all FK relationships in the subcluster
+        for source, target, data in graph.edges(data=True):
+            if source in subcluster and target in subcluster:
+                rel_type = data.get('relationship_type', '')
+                
+                # Primary-Foreign Key (Column-Column) relationship
+                if rel_type == 'pk_fk_column':
+                    if '.' in source and '.' in target:
+                        source_table, source_col = source.split('.')
+                        target_table, target_col = target.split('.')
+                        joins.append((source_table, source_col, target_table, target_col))
+        
+        return joins
+    
+    def extract_subcluster_info(self, graph, subcluster):
+        """
+        Extract structured information from a subcluster for SQL generation.
+        
+        Args:
+            graph: The schema graph
+            subcluster: Set of node IDs in the subcluster
+            
+        Returns:
+            Dictionary with tables, columns, and joins
+        """
+        # Get tables
+        tables = self.get_tables_from_subcluster(graph, subcluster)
+        
+        # Get columns
+        columns_by_table = self.get_columns_from_subcluster(graph, subcluster)
+        
+        # Get joins
+        joins = self.get_joins_from_subcluster(graph, subcluster)
+        
+        # Identify primary table (most important)
+        primary_table = None
+        if tables:
+            # Count connections to determine the central table
+            table_connections = {table: 0 for table in tables}
+            for src, _, tgt, _ in joins:
+                if src in table_connections:
+                    table_connections[src] += 1
+                if tgt in table_connections:
+                    table_connections[tgt] += 1
+            
+            # Table with most connections is likely central
+            primary_table = max(table_connections.items(), key=lambda x: x[1])[0] if table_connections else next(iter(tables))
+        
+        return {
+            'tables': list(tables),
+            'primary_table': primary_table,
+            'columns_by_table': columns_by_table,
+            'joins': joins
+        }
