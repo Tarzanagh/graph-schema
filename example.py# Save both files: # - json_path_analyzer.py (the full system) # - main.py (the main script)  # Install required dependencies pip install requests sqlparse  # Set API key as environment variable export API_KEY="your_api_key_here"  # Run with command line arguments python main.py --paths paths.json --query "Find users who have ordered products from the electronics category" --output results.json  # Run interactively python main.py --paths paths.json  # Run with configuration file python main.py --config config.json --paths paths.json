@@ -1,18 +1,6 @@
-# Save both files:
-# - json_path_analyzer.py (the full system)
-# - main.py (the main script)
-
-# Install required dependencies
-pip install requests sqlparse
-
-# Set API key as environment variable
-export API_KEY="your_api_key_here"
-
-# Run with command line arguments
-python main.py --paths paths.json --query "Find users who have ordered products from the electronics category" --output results.json
-
-# Run interactively
-python main.py --paths paths.json
-
-# Run with configuration file
-python main.py --config config.json --paths paths.json
+ddl_file: "/home/davoud/Spider2/spider2-lite/resource/databases/sqlite/Pagila/DDL.csv"
+db_file: "/home/davoud/Spider2/spider2-lite/resource/databases/spider2-localdb/Pagila.sqlite"
+query: "Please help me find the film category with the highest total rental hours in cities where the city's name either starts with \"A\" or contains a hyphen."
+output_file: "query_paths.json"
+api_url: "http://105.144.47.81:8001/v1/chat/completions"
+model: "llama70b"
