@@ -9,8 +9,8 @@ import argparse
 import math
 import random
 
-class QueryProcessor:
-    """Main class for query processing pipeline with decomposition, weighted flow path finding, and SQL generation."""
+class GraphBasedQueryProcessor:
+    """Main class for query processing pipeline working directly with a graph structure."""
     
     def __init__(self, api_url, api_key, model):
         """
@@ -27,26 +27,23 @@ class QueryProcessor:
         
         # Initialize components for each stage of the pipeline
         self.query_decomposer = QueryDecomposer(api_url, api_key, model)
-        self.path_finder = WeightedFlowPathFinder(api_url, api_key, model)  # Use the new path finder
+        self.path_finder = GraphBasedPathFinder(api_url, api_key, model)
         self.sql_generator = SQLGenerator(api_url, api_key, model)
     
-    def process_query(self, paths_json_file, question):
+    def process_query(self, graph, question):
         """
         Process a natural language query through the pipeline:
         1. Decompose into subqueries
-        2. Find top 10 relevant paths for each subquery using weighted flow diffusion
+        2. Find top 10 relevant paths for each subquery using weighted flow diffusion on the graph
         3. Generate top 10 SQL for each subquery based on paths with rewards
         
         Args:
-            paths_json_file: Path to JSON file containing available paths
+            graph: A graph structure containing nodes and edges
             question: Natural language question
             
         Returns:
             Dictionary with detailed processing results
         """
-        # Load paths data
-        paths_data = self._load_paths_json(paths_json_file)
-        
         # Step 1: Decompose the query into subqueries
         subqueries = self.query_decomposer.decompose_query(question)
         
@@ -55,7 +52,10 @@ class QueryProcessor:
         
         for i, subquery in enumerate(subqueries):
             # Find top 10 relevant paths for this subquery with relevance scores using weighted flow diffusion
-            path_results = self.path_finder.find_top_relevant_paths(paths_data, subquery, limit=10)
+            path_results = self.path_finder.find_top_relevant_paths(graph, subquery, limit=10)
+            
+            # Extract paths from the graph for SQL generation
+            paths_data = self._extract_paths_from_graph(graph, path_results["paths"])
             
             # Generate top 10 SQL for this subquery using the found paths
             sql_results = self.sql_generator.generate_top_subsqls(paths_data, subquery, path_results["paths"], limit=10)
@@ -77,10 +77,40 @@ class QueryProcessor:
             "subquery_results": subquery_results
         }
     
-    def _load_paths_json(self, paths_json_file):
-        """Load paths data from JSON file."""
-        with open(paths_json_file, 'r') as file:
-            return json.load(file)
+    def _extract_paths_from_graph(self, graph, relevant_paths):
+        """
+        Convert relevant paths from the graph structure to the format expected by SQLGenerator.
+        
+        Args:
+            graph: The graph structure
+            relevant_paths: List of path identifiers
+            
+        Returns:
+            List of path strings formatted as needed by SQLGenerator
+        """
+        # For the paths that are already in string format, we can use them directly
+        # For paths that are in path ID format, we need to convert them to actual path strings
+        paths_data = []
+        
+        for path in relevant_paths:
+            if isinstance(path, str) and '.' in path:
+                # This is already in the expected format (e.g., "table1.field1.table2.field2")
+                paths_data.append(path)
+            else:
+                # This is a path ID or node sequence we need to convert
+                # This implementation depends on your graph structure
+                if isinstance(path, (list, tuple)):
+                    # If the path is a list of nodes, join them with dots
+                    paths_data.append('.'.join(path))
+                else:
+                    # Try to look up the path in the graph's paths dictionary if it exists
+                    if hasattr(graph, 'paths') and path in graph.paths:
+                        paths_data.append(graph.paths[path])
+                    else:
+                        # Default fallback - use the path ID as is
+                        paths_data.append(str(path))
+        
+        return paths_data
 
 
 class QueryDecomposer:
@@ -158,68 +188,23 @@ class QueryDecomposer:
             return [question]
 
 
-class WeightedFlowPathFinder:
+class GraphBasedPathFinder:
     """
-    Component for finding relevant paths using Weighted Flow Diffusion algorithm.
+    Component for finding relevant paths in a graph using Weighted Flow Diffusion algorithm.
     Uses both graph structure and node attributes to find local clusters (paths).
     """
     
     def __init__(self, api_url=None, api_key=None, model=None):
-        """Initialize the weighted flow path finder."""
+        """Initialize the graph-based path finder."""
         self.api_url = api_url  # Used for attribute extraction if needed
         self.api_key = api_key  # Used for attribute extraction if needed
         self.model = model      # Used for attribute extraction if needed
         self.gamma = 0.02       # Parameter for Gaussian kernel weighting
         self.max_iterations = 30  # Maximum iterations for flow diffusion
-        
-    def build_graph_from_paths(self, paths_data):
-        """
-        Build a graph representation from the paths data.
-        
-        Args:
-            paths_data: JSON data containing available paths
-            
-        Returns:
-            graph: A graph representation with nodes and edges
-        """
-        graph = {
-            'nodes': {},  # node_id -> node attributes
-            'edges': [],  # list of (source, target, weight) tuples
-            'adjacency': {}  # node_id -> list of neighboring node_ids
-        }
-        
-        # Extract nodes and edges from paths
-        path_elements = set()
-        for path in paths_data:
-            elements = path.split('.')
-            path_elements.update(elements)
-            
-            # Add edges between consecutive elements in the path
-            for i in range(len(elements) - 1):
-                source = elements[i]
-                target = elements[i+1]
-                
-                # Add nodes if they don't exist
-                if source not in graph['nodes']:
-                    graph['nodes'][source] = {'name': source}
-                    graph['adjacency'][source] = []
-                    
-                if target not in graph['nodes']:
-                    graph['nodes'][target] = {'name': target}
-                    graph['adjacency'][target] = []
-                
-                # Add edge
-                if target not in graph['adjacency'][source]:
-                    graph['adjacency'][source].append(target)
-                    graph['adjacency'][target].append(source)  # Undirected graph
-                    graph['edges'].append((source, target, 1.0))  # Initial weight = 1.0
-        
-        return graph
     
     def extract_attributes(self, graph, query):
         """
         Extract attributes for nodes based on semantic similarity to query.
-        This is a simplified approach - in a real system, you might use embeddings.
         
         Args:
             graph: The graph representation
@@ -367,41 +352,61 @@ class WeightedFlowPathFinder:
         
         return best_node
     
-    def extract_paths_from_subgraph(self, graph, important_nodes, paths_data, limit=10):
+    def extract_paths_from_subgraph(self, graph, important_nodes, limit=10):
         """
-        Extract paths that contain the important nodes identified by flow diffusion.
+        Extract paths from the subgraph of important nodes identified by flow diffusion.
         
         Args:
             graph: The graph representation
             important_nodes: Dictionary mapping nodes to importance scores
-            paths_data: Original paths data
             limit: Maximum number of paths to return
             
         Returns:
-            List of relevant paths and their relevance scores
+            Dictionary with paths and their relevance scores
         """
-        path_scores = {}
-        
         # Filter nodes with positive importance
         active_nodes = {node: score for node, score in important_nodes.items() if score > 0}
         
         if not active_nodes:
             return {"paths": [], "relevance_scores": {}}
         
-        # Score each path based on the importance of nodes it contains
-        for path in paths_data:
-            elements = path.split('.')
-            
-            # Calculate path score as sum of node importance scores
-            score = sum(active_nodes.get(element, 0) for element in elements)
-            
-            if score > 0:
-                path_scores[path] = score
+        # Find paths by doing a breadth-first search from each important node
+        # This is a simplified approach - you might want to use a more sophisticated path finding algorithm
+        paths = []
+        path_scores = {}
         
-        # Sort paths by score
+        # Sort nodes by importance for prioritization
+        sorted_nodes = sorted(active_nodes.items(), key=lambda x: x[1], reverse=True)
+        
+        # For each important node, find paths to other important nodes
+        for start_node, start_score in sorted_nodes[:min(5, len(sorted_nodes))]:
+            # BFS to find paths
+            queue = [(start_node, [start_node])]
+            visited = set([start_node])
+            
+            while queue and len(paths) < limit * 2:  # Find more paths than needed, then filter
+                current_node, current_path = queue.pop(0)
+                
+                # If we've reached another important node, record the path
+                if current_node != start_node and current_node in active_nodes:
+                    # Convert path to string format
+                    path_str = '.'.join(current_path)
+                    
+                    # Calculate path score as sum of node importance scores
+                    score = sum(active_nodes.get(node, 0) for node in current_path)
+                    
+                    paths.append(path_str)
+                    path_scores[path_str] = score
+                
+                # Continue BFS if path is not too long
+                if len(current_path) < 5:  # Limit path length to avoid exponential explosion
+                    for neighbor in graph['adjacency'].get(current_node, []):
+                        if neighbor not in visited:
+                            visited.add(neighbor)
+                            queue.append((neighbor, current_path + [neighbor]))
+        
+        # Sort paths by score and take top limit
         sorted_paths = sorted(path_scores.items(), key=lambda x: x[1], reverse=True)
-        
-        # Take top paths
         top_paths = sorted_paths[:limit]
         
         # Normalize scores to [0, 1] range
@@ -423,42 +428,35 @@ class WeightedFlowPathFinder:
             "relevance_scores": normalized_scores
         }
     
-    def find_top_relevant_paths(self, paths_data, subquery, limit=10, seed_path=None):
+    def find_top_relevant_paths(self, graph, subquery, limit=10, seed_node=None):
         """
         Find top relevant paths for a given subquery using weighted flow diffusion.
         
         Args:
-            paths_data: JSON data containing available paths
+            graph: The graph structure containing nodes and edges
             subquery: The subquery text
             limit: Maximum number of paths to return (default: 10)
-            seed_path: Optional seed path to start from
+            seed_node: Optional seed node to start from
             
         Returns:
             Dictionary with paths and their relevance scores
         """
         try:
-            # Step 1: Build graph representation from paths
-            graph = self.build_graph_from_paths(paths_data)
+            # Step 1: Extract node attributes based on query relevance
+            graph_with_attributes = self.extract_attributes(graph, subquery)
             
-            # Step 2: Extract node attributes based on query
-            graph = self.extract_attributes(graph, subquery)
+            # Step 2: Reweight edges based on attribute similarity
+            graph_with_weights = self.reweight_edges(graph_with_attributes)
             
-            # Step 3: Reweight edges based on attribute similarity
-            graph = self.reweight_edges(graph)
+            # Step 3: Identify best seed node if not provided
+            if not seed_node:
+                seed_node = self.identify_seed_node(graph_with_weights, subquery)
             
-            # Step 4: Identify best seed node if not provided
-            if not seed_path:
-                seed_node = self.identify_seed_node(graph, subquery)
-            else:
-                # Use the first element of the seed path as the seed node
-                seed_elements = seed_path.split('.')
-                seed_node = seed_elements[0] if seed_elements else None
+            # Step 4: Run flow diffusion from seed node
+            node_importance = self.flow_diffusion(graph_with_weights, seed_node)
             
-            # Step 5: Run flow diffusion from seed node
-            node_importance = self.flow_diffusion(graph, seed_node)
-            
-            # Step 6: Extract relevant paths based on node importance
-            result = self.extract_paths_from_subgraph(graph, node_importance, paths_data, limit)
+            # Step 5: Extract relevant paths based on node importance
+            result = self.extract_paths_from_subgraph(graph_with_weights, node_importance, limit)
             
             return result
             
@@ -493,7 +491,7 @@ class SQLGenerator:
         Generate top SQL statements for a subquery based on relevant paths and automatically evaluate them.
         
         Args:
-            paths_data: JSON data containing available paths
+            paths_data: List of path strings
             subquery: The subquery text
             relevant_paths: List of relevant paths for this subquery
             limit: Maximum number of SQL statements to generate (default: 10)
@@ -756,6 +754,7 @@ class SQLGenerator:
     
     def _evaluate_query_planning(self, sql):
         """Evaluate multi-step or nested SQL structures"""
+        # ... [implementation remains the same as in original code] ...
         sql_upper = sql.upper()
         
         # Check for advanced SQL structures
@@ -824,129 +823,3 @@ class SQLGenerator:
         optimization_bonus = min(0.5, optimizations * 0.125)
         
         return max(0.0, min(1.0, base_score - inefficiency_penalty + optimization_bonus))
-    
-    def _evaluate_divergence(self, sql, all_sqls):
-        """Evaluate how much this SQL diverges from other solutions"""
-        similarity_scores = []
-        
-        # Compare this SQL to all others
-        for other_sql in all_sqls:
-            if sql == other_sql:
-                continue  # Skip comparing to itself
-                
-            # Calculate similarity ratio
-            similarity = difflib.SequenceMatcher(None, sql, other_sql).ratio()
-            similarity_scores.append(similarity)
-        
-        # If no other SQLs to compare to, give a medium score
-        if not similarity_scores:
-            return 0.5
-        
-        # Average similarity to other SQL statements
-        avg_similarity = sum(similarity_scores) / len(similarity_scores)
-        
-        # Divergence is the inverse of similarity (high similarity = low divergence)
-        # But we want a little divergence (to encourage exploration), so we'll score
-        # highest for moderate divergence
-        if avg_similarity < 0.3:
-            # Too different, possibly incorrect - moderate score
-            return 0.5
-        elif avg_similarity > 0.8:
-            # Too similar to other solutions - low score
-            return 0.3
-        else:
-            # Good balance - high score
-            return 0.9
-
-
-def parse_args():
-    """Parse command line arguments."""
-    parser = argparse.ArgumentParser(description='Process queries using Weighted Flow Path Analyzer')
-    parser.add_argument('--config', type=str, help='Path to config file with API credentials')
-    parser.add_argument('--paths', type=str, required=True, help='Path to JSON file containing paths')
-    parser.add_argument('--query', type=str, help='Query to process')
-    parser.add_argument('--output', type=str, help='Path to save results as JSON')
-    return parser.parse_args()
-
-
-def main():
-    """Main function to run the Weighted Flow Path Analyzer with configuration from a JSON file."""
-    # Parse command line arguments
-    args = parse_args()
-    
-    # Load configuration from JSON file
-    config_file = args.config or "config.json"    
-    with open(config_file, 'r') as f:
-        config = json.load(f)
-    
-    # Check if paths file exists
-    paths_json_file = args.paths or config.get("paths_file")
-    if not paths_json_file:
-        print("Error: No paths file specified")
-        return
-    
-    # Get API key from config or environment
-    api_key = config.get("api_key") or os.environ.get("API_KEY", "")
-    if not api_key:
-        print("Error: No API key found")
-        return
-    
-    # Initialize the query processor with the configuration
-    processor = QueryProcessor(
-        api_url=config["api_url"],
-        api_key=api_key,
-        model=config["model"]
-    )
-    
-    # Process the query
-    query = args.query or config.get("query")
-    if not query:
-        print("Error: No query specified")
-        return
-        
-    print(f"Processing query: {query}")
-    print(f"Using paths from: {paths_json_file}")
-    results = processor.process_query(paths_json_file, query)
-    
-    # Print the results
-    print_results(results)
-    
-    # Also save results to file
-    output_file = args.output or config.get("output_file", "query_results.json")
-    with open(output_file, 'w') as f:
-        json.dump(results, f, indent=2)
-    print(f"Results saved to {output_file}")
-
-
-def print_results(results):
-    """Print results in a readable format."""
-    print("\n" + "="*80)
-    print(f"QUERY: {results['original_query']}")
-    print("="*80)
-    
-    print("\nSUBQUERIES:")
-    for i, subquery in enumerate(results["subqueries"]):
-        print(f"  {chr(65+i)}. {subquery}")
-    
-    for result in results["subquery_results"]:
-        print("\n" + "-"*80)
-        print(f"SUBQUERY {result['subquery_id']}: {result['subquery_text']}")
-        print("-"*80)
-        
-        print("\nTOP RELEVANT PATHS:")
-        for i, path in enumerate(result["top_paths"]):
-            relevance = result["path_relevance_scores"].get(path, 0.0)
-            print(f"  {i+1}. {path} (Relevance: {relevance:.2f})")
-        
-        print("\nTOP SQL STATEMENTS:")
-        for i, sql in enumerate(result["top_sqls"]):
-            rewards = result["sql_rewards"].get(sql, {})
-            print(f"\n  SQL #{i+1}:")
-            print(f"  {sql.replace(chr(10), chr(10)+'  ')}")
-            print("\n  Rewards:")
-            for reward_type, score in rewards.items():
-                print(f"    {reward_type}: {score:.2f}")
-
-
-if __name__ == "__main__":
-    main()
