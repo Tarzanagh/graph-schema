@@ -1,0 +1,216 @@
+"""
+schema_graph.py - Module for constructing and managing database schema graphs
+"""
+
+import sqlite3
+import networkx as nx
+import time
+import json
+from typing import Dict, List, Tuple, Any
+
+def create_schema_graph(db_file):
+    """
+    Extract an optimized schema graph from the database with efficient construction.
+    
+    Args:
+        db_file: Path to the SQLite database file
+        
+    Returns:
+        A tuple of (nx.DiGraph, dict) containing the graph and metadata for later use
+    """
+    start_time = time.time()
+    
+    # Create directed graph
+    graph = nx.DiGraph()
+    
+    # Connect to database
+    conn = sqlite3.connect(db_file)
+    cursor = conn.cursor()
+    
+    # Execute a single query to get all tables
+    cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")
+    tables = [table[0] for table in cursor.fetchall()]
+    
+    # Pre-allocate data structures
+    primary_keys = {}
+    foreign_keys = {}
+    all_columns = {}
+    table_column_info = {}
+    
+    # First pass: Get all schema information in batch
+    for table in tables:
+        # Get columns for this table
+        cursor.execute(f"PRAGMA table_info({table});")
+        columns = cursor.fetchall()
+        table_column_info[table] = columns
+        
+        # Get foreign keys for this table
+        cursor.execute(f"PRAGMA foreign_key_list({table});")
+        foreign_keys[table] = cursor.fetchall()
+    
+    # Second pass: Build graph nodes efficiently
+    for table in tables:
+        # Add table node with all attributes at once
+        graph.add_node(table, type='table', node_class='table')
+        
+        columns = table_column_info[table]
+        primary_keys[table] = []
+        all_columns[table] = []
+        
+        # Add all column nodes for this table at once
+        for col in columns:
+            col_name = col[1]
+            col_id = f"{table}.{col_name}"
+            is_pk = col[5] == 1
+            
+            # Add column node with all attributes
+            graph.add_node(col_id, 
+                          type='column',
+                          node_class='column', 
+                          data_type=col[2],
+                          table=table,
+                          column_name=col_name,
+                          is_primary_key=is_pk,
+                          not_null=col[3]==1)
+            
+            all_columns[table].append(col_id)
+            
+            if is_pk:
+                primary_keys[table].append(col_id)
+    
+    # Third pass: Build all edges efficiently
+    # Pre-compute edge lists for batch addition
+    edges_to_add = []
+    
+    # Add table-column edges
+    for table, columns in all_columns.items():
+        for col_id in columns:
+            edges_to_add.append((table, col_id, {'relationship_type': 'table_column', 
+                                               'relationship': f"Column in {table}"}))
+    
+    # Add same-table edges
+    for table, columns in all_columns.items():
+        for i, col1 in enumerate(columns):
+            for col2 in columns[i+1:]:
+                rel = {'relationship_type': 'same_table', 'relationship': f"Columns in same table ({table})"}
+                edges_to_add.append((col1, col2, rel))
+                edges_to_add.append((col2, col1, rel))
+    
+    # Process foreign keys
+    fk_relationships = []
+    for table, fk_list in foreign_keys.items():
+        for fk in fk_list:
+            fk_col = fk[3]          # Column in current table
+            ref_table = fk[2]       # Referenced table
+            ref_col = fk[4]         # Referenced column
+            
+            fk_col_id = f"{table}.{fk_col}"
+            ref_col_id = f"{ref_table}.{ref_col}"
+            
+            # Primary-Foreign Key (Column-Column)
+            edges_to_add.append((fk_col_id, ref_col_id, 
+                               {'relationship_type': 'pk_fk_column', 
+                                'relationship': f"Foreign key reference"}))
+            
+            # Foreign Key (Column-Table)
+            edges_to_add.append((fk_col_id, ref_table, 
+                               {'relationship_type': 'fk_table', 
+                                'relationship': f"Foreign key to table"}))
+            
+            # Primary-Foreign Key (Table-Table)
+            edges_to_add.append((table, ref_table, 
+                               {'relationship_type': 'pk_fk_table', 
+                                'relationship': f"Table foreign key relationship"}))
+            
+            # Store for later use
+            fk_relationships.append((fk_col_id, ref_table, ref_col_id))
+    
+    # Add Primary Key (Column-Table) edges
+    for table, pk_cols in primary_keys.items():
+        for pk_col in pk_cols:
+            edges_to_add.append((pk_col, table, 
+                               {'relationship_type': 'pk_table', 
+                                'relationship': f"Primary key of table"}))
+    
+    # Add all edges at once
+    graph.add_edges_from(edges_to_add)
+    
+    conn.close()
+    
+    # Extract schema details for LLM
+    schema_details = []
+    for table in tables:
+        columns = []
+        for col in table_column_info[table]:
+            col_info = {
+                "name": col[1],
+                "type": col[2],
+                "is_pk": col[5] == 1,
+                "not_null": col[3] == 1
+            }
+            columns.append(col_info)
+        
+        fks = []
+        for fk in foreign_keys[table]:
+            fk_info = {
+                "column": fk[3],
+                "ref_table": fk[2],
+                "ref_column": fk[4]
+            }
+            fks.append(fk_info)
+        
+        table_info = {
+            "table_name": table,
+            "columns": columns,
+            "foreign_keys": fks,
+            "primary_keys": [col[1] for col in table_column_info[table] if col[5] == 1]
+        }
+        schema_details.append(table_info)
+    
+    # Create metadata for efficient access
+    metadata = {
+        'tables': tables,
+        'primary_keys': primary_keys,
+        'foreign_keys': fk_relationships,
+        'all_columns': all_columns,
+        'schema_details': schema_details
+    }
+    
+    # Print statistics
+    print(f"Schema graph created in {time.time() - start_time:.2f} seconds with:")
+    print(f" - {len(tables)} table nodes")
+    print(f" - {sum(len(cols) for cols in all_columns.values())} column nodes")
+    print(f" - {graph.number_of_edges()} total edges")
+    
+    return graph, metadata
+
+
+def format_schema_for_prompt(schema_details):
+    """
+    Format schema details for inclusion in LLM prompts.
+    
+    Args:
+        schema_details: List of dictionaries containing schema information
+        
+    Returns:
+        String representation of the schema
+    """
+    schema_text = "DATABASE SCHEMA:\n"
+    
+    for table in schema_details:
+        schema_text += f"Table: {table['table_name']}\n"
+        schema_text += "Columns:\n"
+        
+        for col in table['columns']:
+            pk_marker = " (Primary Key)" if col['is_pk'] else ""
+            null_marker = " NOT NULL" if col['not_null'] else ""
+            schema_text += f"  - {col['name']} ({col['type']}){pk_marker}{null_marker}\n"
+        
+        if table['foreign_keys']:
+            schema_text += "Foreign Keys:\n"
+            for fk in table['foreign_keys']:
+                schema_text += f"  - {fk['column']} -> {fk['ref_table']}.{fk['ref_column']}\n"
+        
+        schema_text += "\n"
+    
+    return schema_text
