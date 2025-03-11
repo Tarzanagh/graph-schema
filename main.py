@@ -1,37 +1,41 @@
 #!/usr/bin/env python3
 """
-Main script to run the JSON Path Analyzer with hardcoded configuration.
+Main script to run the JSON Path Analyzer with configuration from a JSON file.
 """
 
 import json
 import os
 import sys
-import argparse
 from json_path_analyzer import QueryProcessor
 
 def main():
-    """Main function to run the Path Analyzer with hardcoded configuration."""
-    # Hardcoded configuration
-    config = {
-        "ddl_file": "/home/davoud/Spider2/spider2-lite/resource/databases/sqlite/Pagila/DDL.csv",
-        "db_file": "/home/davoud/Spider2/spider2-lite/resource/databases/spider2-localdb/Pagila.sqlite",
-        "query": "Please help me find the film category with the highest total rental hours in cities where the city's name either starts with \"A\" or contains a hyphen.",
-        "output_file": "query_paths.json",
-        "api_url": "http://105.144.47.81:8001/v1/chat/completions",
-        "model": "llama70b"
-    }
+    """Main function to run the Path Analyzer with configuration from a JSON file."""
+    # Load configuration from JSON file
+    config_file = "config.json"
+    if not os.path.exists(config_file):
+        print(f"Error: Configuration file not found: {config_file}")
+        sys.exit(1)
     
-    # Check if paths file exists (assuming it's in the output_file)
-    paths_json_file = config.get("output_file")
+    with open(config_file, 'r') as f:
+        config = json.load(f)
+    
+    # Check if paths file exists
+    paths_json_file = config.get("paths_file")
     if not os.path.exists(paths_json_file):
         print(f"Error: Paths file not found: {paths_json_file}")
         print("Make sure to generate the paths file first.")
         sys.exit(1)
     
-    # Initialize the query processor with the hardcoded configuration
+    # Get API key from config or environment
+    api_key = config.get("api_key") or os.environ.get("API_KEY", "")
+    if not api_key:
+        print("Error: API key is required. Set it in the config file or as API_KEY environment variable.")
+        sys.exit(1)
+    
+    # Initialize the query processor with the configuration
     processor = QueryProcessor(
         api_url=config["api_url"],
-        api_key=os.environ.get("API_KEY", ""),  # Still get API key from environment
+        api_key=api_key,
         model=config["model"]
     )
     
@@ -45,7 +49,7 @@ def main():
     print_results(results)
     
     # Also save results to file
-    output_file = "query_results.json"  # Different from the paths file
+    output_file = config.get("output_file", "query_results.json")
     with open(output_file, 'w') as f:
         json.dump(results, f, indent=2)
     print(f"Results saved to {output_file}")
