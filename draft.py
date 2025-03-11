@@ -745,3 +745,4 @@ if __name__ == "__main__":
     main()
 
 # python PathAnalyzer.py  --paths database_schema_paths.json
+paths_match = re.search(r'<RELEVANT_PATHS>(.*?)</RELEVANT_PATHS>', content, re.DOTALL)
