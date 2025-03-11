@@ -1,263 +1,83 @@
-import json
-from graph_based_query_processor import GraphBasedQueryProcessor, create_graph_from_multiple_sources
+import os
+import time
+from optimized_schema_graph import OptimizedQueryProcessor
 
-def example_with_adjacency_list():
-    """Example using an adjacency list representation of a database schema"""
+def main():
+    """
+    Demonstrate usage of the OptimizedQueryProcessor with a sample database.
+    """
+    # Path to your SQLite database
+    db_file = "your_database.sqlite"
     
-    # Sample adjacency list representation of a database schema graph
-    # node -> list of connected nodes
-    schema_graph = {
-        "customers": ["customer_id", "name", "email", "address", "orders"],
-        "customer_id": ["customers"],
-        "name": ["customers"],
-        "email": ["customers"],
-        "address": ["customers", "city", "country"],
-        "city": ["address"],
-        "country": ["address"],
-        "orders": ["customers", "order_id", "order_date", "total_amount", "order_items"],
-        "order_id": ["orders"],
-        "order_date": ["orders"],
-        "total_amount": ["orders"],
-        "order_items": ["orders", "product_id", "quantity", "price", "products"],
-        "product_id": ["order_items", "products"],
-        "quantity": ["order_items"],
-        "price": ["order_items", "products"],
-        "products": ["product_id", "product_name", "description", "price", "stock", "category", "order_items"],
-        "product_name": ["products"],
-        "description": ["products"],
-        "stock": ["products"],
-        "category": ["products", "category_id", "category_name"],
-        "category_id": ["category"],
-        "category_name": ["category"]
-    }
-    
-    # Create a graph structure from the adjacency list
-    graph = create_graph_from_multiple_sources(schema_graph, "adjacency")
-    
-    # Print basic statistics about the graph
-    print(f"Graph has {len(graph['nodes'])} nodes and {len(graph['edges'])} edges")
+    # Check if database exists
+    if not os.path.exists(db_file):
+        print(f"Error: Database file '{db_file}' not found.")
+        print("Please update the path to your database file.")
+        return
     
     # Initialize the query processor
-    processor = GraphBasedQueryProcessor(
-        api_url="https://api.openai.com/v1/chat/completions",
-        api_key="your_api_key_here",  # Replace with actual API key
-        model="gpt-4"
-    )
+    print(f"Initializing query processor with database: {db_file}")
+    start_time = time.time()
+    processor = OptimizedQueryProcessor(db_file)
+    print(f"Initialization completed in {time.time() - start_time:.2f} seconds\n")
     
-    # Sample natural language query
-    query = "Find all customers who ordered products in the 'Electronics' category last month"
-    
-    # Option 1: Skip actual API calls for demonstration
-    print(f"[DEMO MODE] Processing query: {query}")
-    print("In a real scenario, this would call the API to process the query through the pipeline.")
-    
-    """
-    # Option 2: Uncomment this section to actually process the query
-    print(f"Processing query: {query}")
-    results = processor.process_query(graph, query)
-    
-    # Print the results
-    print(json.dumps(results, indent=2))
-    """
-
-
-def example_with_path_strings():
-    """Example using path strings to represent database relationships"""
-    
-    # Sample paths representing relations in a database
-    schema_paths = [
-        "customers.customer_id",
-        "customers.name",
-        "customers.email",
-        "customers.address.city",
-        "customers.address.country",
-        "customers.orders.order_id",
-        "customers.orders.order_date",
-        "customers.orders.total_amount",
-        "customers.orders.order_items.product_id",
-        "customers.orders.order_items.quantity",
-        "customers.orders.order_items.price",
-        "customers.orders.order_items.products.product_name",
-        "customers.orders.order_items.products.description",
-        "customers.orders.order_items.products.stock",
-        "customers.orders.order_items.products.category.category_name"
+    # Process some example queries
+    example_queries = [
+        "Find all customers who have placed orders in the last month",
+        "Show products with the highest sales volume",
+        "List employees who manage more than 5 people and have been at the company for over 3 years",
+        "What is the average order value for each product category?"
     ]
     
-    # Create a graph structure from the path strings
-    graph = create_graph_from_multiple_sources(schema_paths, "paths")
-    
-    # Print basic statistics about the graph
-    print(f"Graph has {len(graph['nodes'])} nodes and {len(graph['edges'])} edges")
-    
-    # Initialize the query processor 
-    processor = GraphBasedQueryProcessor(
-        api_url="https://api.openai.com/v1/chat/completions",
-        api_key="your_api_key_here",  # Replace with actual API key
-        model="gpt-4"
-    )
-    
-    # Sample natural language query
-    query = "Which customers spent the most on electronics products last year?"
-    
-    # Option 1: Skip actual API calls for demonstration
-    print(f"[DEMO MODE] Processing query: {query}")
-    print("In a real scenario, this would call the API to process the query through the pipeline.")
-    
-    """
-    # Option 2: Uncomment this section to actually process the query
-    print(f"Processing query: {query}")
-    results = processor.process_query(graph, query)
-    
-    # Print the results
-    print(json.dumps(results, indent=2))
-    """
-
-
-def example_with_edge_list():
-    """Example using an edge list with weights to represent database schema"""
-    
-    # Sample edge list with weights
-    # (node1, node2, weight)
-    schema_edges = [
-        ("customers", "customer_id", 1.0),
-        ("customers", "name", 1.0),
-        ("customers", "email", 1.0),
-        ("customers", "address", 1.0),
-        ("address", "city", 1.0),
-        ("address", "country", 1.0),
-        ("customers", "orders", 1.0),
-        ("orders", "order_id", 1.0),
-        ("orders", "order_date", 1.0),
-        ("orders", "total_amount", 1.0),
-        ("orders", "order_items", 1.0),
-        ("order_items", "product_id", 1.0),
-        ("order_items", "quantity", 1.0),
-        ("order_items", "price", 1.0),
-        ("order_items", "products", 1.0),
-        ("products", "product_id", 1.0),
-        ("products", "product_name", 1.0),
-        ("products", "description", 1.0),
-        ("products", "price", 1.0),
-        ("products", "stock", 1.0),
-        ("products", "category", 1.0),
-        ("category", "category_id", 1.0),
-        ("category", "category_name", 1.0)
-    ]
-    
-    # Create a graph structure from the edge list
-    graph = create_graph_from_multiple_sources(schema_edges, "edges")
-    
-    # Print basic statistics about the graph
-    print(f"Graph has {len(graph['nodes'])} nodes and {len(graph['edges'])} edges")
-    
-    # Initialize the query processor
-    processor = GraphBasedQueryProcessor(
-        api_url="https://api.openai.com/v1/chat/completions",
-        api_key="your_api_key_here",  # Replace with actual API key
-        model="gpt-4"
-    )
-    
-    # Sample natural language query
-    query = "List all products that have been ordered by customers in New York"
-    
-    # Option 1: Skip actual API calls for demonstration
-    print(f"[DEMO MODE] Processing query: {query}")
-    print("In a real scenario, this would call the API to process the query through the pipeline.")
-    
-    """
-    # Option 2: Uncomment this section to actually process the query
-    print(f"Processing query: {query}")
-    results = processor.process_query(graph, query)
-    
-    # Print the results
-    print(json.dumps(results, indent=2))
-    """
-
-
-def example_with_networkx():
-    """Example using NetworkX to create and represent the graph"""
-    
-    try:
-        import networkx as nx
+    for i, query in enumerate(example_queries):
+        print(f"Example {i+1}: '{query}'")
         
-        # Create a NetworkX graph
-        G = nx.Graph()
+        # Process the query
+        start_time = time.time()
+        results = processor.process_query(query)
+        processing_time = time.time() - start_time
         
-        # Add nodes with attributes
-        G.add_node("customers", type="table")
-        G.add_node("customer_id", type="field")
-        G.add_node("name", type="field")
-        G.add_node("email", type="field")
-        G.add_node("address", type="field")
-        G.add_node("orders", type="table")
-        G.add_node("order_id", type="field")
-        G.add_node("order_date", type="field")
-        G.add_node("total_amount", type="field")
-        G.add_node("products", type="table")
-        G.add_node("product_id", type="field")
-        G.add_node("product_name", type="field")
-        G.add_node("price", type="field")
-        G.add_node("category", type="table")
-        G.add_node("category_name", type="field")
+        # Print results
+        print(f"  Processing time: {processing_time:.2f} seconds")
+        print(f"  Decomposed into {len(results['subqueries'])} subqueries:")
         
-        # Add edges with weights
-        G.add_edge("customers", "customer_id", weight=1.0)
-        G.add_edge("customers", "name", weight=1.0)
-        G.add_edge("customers", "email", weight=1.0)
-        G.add_edge("customers", "address", weight=1.0)
-        G.add_edge("customers", "orders", weight=0.8)
-        G.add_edge("orders", "order_id", weight=1.0)
-        G.add_edge("orders", "order_date", weight=1.0)
-        G.add_edge("orders", "total_amount", weight=1.0)
-        G.add_edge("orders", "products", weight=0.8)
-        G.add_edge("products", "product_id", weight=1.0)
-        G.add_edge("products", "product_name", weight=1.0)
-        G.add_edge("products", "price", weight=1.0)
-        G.add_edge("products", "category", weight=0.8)
-        G.add_edge("category", "category_name", weight=1.0)
+        for j, subquery_result in enumerate(results['subquery_results']):
+            print(f"    {subquery_result['subquery_id']}: '{subquery_result['subquery_text']}'")
+            
+            # Print paths
+            print(f"    Found {len(subquery_result['top_paths'])} relevant paths:")
+            for k, path in enumerate(subquery_result['top_paths'][:2]):
+                print(f"      Path {k+1}: {path}")
+            
+            if len(subquery_result['top_paths']) > 2:
+                print(f"      ... and {len(subquery_result['top_paths'])-2} more paths")
+            
+            # Print generated SQL
+            print(f"    Generated {len(subquery_result['sql_statements'])} SQL statements:")
+            for k, sql in enumerate(subquery_result['sql_statements']):
+                print(f"      SQL {k+1}: {sql}")
+            
+            print()
         
-        # Create a graph structure from the NetworkX graph
-        graph = create_graph_from_multiple_sources(G, "networkx")
+        # Optional: Execute the first SQL statement
+        if results['subquery_results'] and results['subquery_results'][0]['sql_statements']:
+            first_sql = results['subquery_results'][0]['sql_statements'][0]
+            print("  Executing first SQL statement:")
+            print(f"    {first_sql}")
+            
+            # Uncomment to actually execute
+            # query_results = processor.execute_sql(first_sql)
+            # if "error" in query_results:
+            #     print(f"    Error: {query_results['error']}")
+            # else:
+            #     print(f"    Found {len(query_results['rows'])} rows")
+            #     print(f"    Columns: {', '.join(query_results['columns'])}")
+            #     for row in query_results['rows'][:3]:
+            #         print(f"    {row}")
+            #     if len(query_results['rows']) > 3:
+            #         print(f"    ... and {len(query_results['rows'])-3} more rows")
         
-        # Print basic statistics about the graph
-        print(f"Graph has {len(graph['nodes'])} nodes and {len(graph['edges'])} edges")
-        
-        # Initialize the query processor
-        processor = GraphBasedQueryProcessor(
-            api_url="https://api.openai.com/v1/chat/completions",
-            api_key="your_api_key_here",  # Replace with actual API key
-            model="gpt-4"
-        )
-        
-        # Sample natural language query
-        query = "What is the total revenue from each product category?"
-        
-        # Option 1: Skip actual API calls for demonstration
-        print(f"[DEMO MODE] Processing query: {query}")
-        print("In a real scenario, this would call the API to process the query through the pipeline.")
-        
-        """
-        # Option 2: Uncomment this section to actually process the query
-        print(f"Processing query: {query}")
-        results = processor.process_query(graph, query)
-        
-        # Print the results
-        print(json.dumps(results, indent=2))
-        """
-        
-    except ImportError:
-        print("This example requires NetworkX. Install it with: pip install networkx")
-
+        print("\n" + "="*80 + "\n")
 
 if __name__ == "__main__":
-    print("===== Example with Adjacency List =====")
-    example_with_adjacency_list()
-    
-    print("\n===== Example with Path Strings =====")
-    example_with_path_strings()
-    
-    print("\n===== Example with Edge List =====")
-    example_with_edge_list()
-    
-    print("\n===== Example with NetworkX =====")
-    example_with_networkx()
+    main()
