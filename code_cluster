@@ -1,263 +1,325 @@
-import json
-import re
-import requests
-import sqlparse
-import difflib
-import os
-import sys
-import argparse
+import sqlite3
+import networkx as nx
 import math
-import random
+import re
+import json
+import numpy as np
+from collections import defaultdict
+import time
+from typing import Dict, List, Tuple, Set, Any
 
-class GraphBasedQueryProcessor:
-    """Main class for query processing pipeline working directly with a graph structure."""
+def create_schema_graph(db_file):
+    """
+    Extract an optimized schema graph from the database with efficient construction.
     
-    def __init__(self, api_url, api_key, model):
+    Args:
+        db_file: Path to the SQLite database file
+        
+    Returns:
+        A tuple of (nx.DiGraph, dict) containing the graph and metadata for later use
+    """
+    start_time = time.time()
+    
+    # Create directed graph
+    graph = nx.DiGraph()
+    
+    # Connect to database
+    conn = sqlite3.connect(db_file)
+    cursor = conn.cursor()
+    
+    # Execute a single query to get all tables instead of multiple queries
+    cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")
+    tables = [table[0] for table in cursor.fetchall()]
+    
+    # Pre-allocate data structures to avoid repeated dictionary lookups
+    primary_keys = {}
+    foreign_keys = {}
+    all_columns = {}
+    table_column_info = {}
+    
+    # First pass: Get all schema information in batch where possible
+    for table in tables:
+        # Get columns for this table
+        cursor.execute(f"PRAGMA table_info({table});")
+        columns = cursor.fetchall()
+        table_column_info[table] = columns
+        
+        # Get foreign keys for this table
+        cursor.execute(f"PRAGMA foreign_key_list({table});")
+        foreign_keys[table] = cursor.fetchall()
+    
+    # Second pass: Build graph nodes efficiently
+    for table in tables:
+        # Add table node with all attributes at once
+        graph.add_node(table, type='table', node_class='table')
+        
+        columns = table_column_info[table]
+        primary_keys[table] = []
+        all_columns[table] = []
+        
+        # Add all column nodes for this table at once
+        for col in columns:
+            col_name = col[1]
+            col_id = f"{table}.{col_name}"
+            is_pk = col[5] == 1
+            
+            # Add column node with all attributes
+            graph.add_node(col_id, 
+                          type='column',
+                          node_class='column', 
+                          data_type=col[2],
+                          table=table,
+                          column_name=col_name,
+                          is_primary_key=is_pk,
+                          not_null=col[3]==1)
+            
+            all_columns[table].append(col_id)
+            
+            if is_pk:
+                primary_keys[table].append(col_id)
+    
+    # Third pass: Build all edges efficiently
+    # Pre-compute edge lists for batch addition
+    edges_to_add = []
+    
+    # Add table-column edges
+    for table, columns in all_columns.items():
+        for col_id in columns:
+            edges_to_add.append((table, col_id, {'relationship_type': 'table_column', 
+                                               'relationship': f"Column in {table}"}))
+    
+    # Add same-table edges efficiently
+    for table, columns in all_columns.items():
+        for i, col1 in enumerate(columns):
+            for col2 in columns[i+1:]:
+                rel = {'relationship_type': 'same_table', 'relationship': f"Columns in same table ({table})"}
+                edges_to_add.append((col1, col2, rel))
+                edges_to_add.append((col2, col1, rel))
+    
+    # Process foreign keys and add relevant edges
+    fk_relationships = []
+    for table, fk_list in foreign_keys.items():
+        for fk in fk_list:
+            fk_col = fk[3]          # Column in current table
+            ref_table = fk[2]       # Referenced table
+            ref_col = fk[4]         # Referenced column
+            
+            fk_col_id = f"{table}.{fk_col}"
+            ref_col_id = f"{ref_table}.{ref_col}"
+            
+            # Primary-Foreign Key (Column-Column)
+            edges_to_add.append((fk_col_id, ref_col_id, 
+                               {'relationship_type': 'pk_fk_column', 
+                                'relationship': f"Foreign key reference"}))
+            
+            # Foreign Key (Column-Table)
+            edges_to_add.append((fk_col_id, ref_table, 
+                               {'relationship_type': 'fk_table', 
+                                'relationship': f"Foreign key to table"}))
+            
+            # Primary-Foreign Key (Table-Table)
+            edges_to_add.append((table, ref_table, 
+                               {'relationship_type': 'pk_fk_table', 
+                                'relationship': f"Table foreign key relationship"}))
+            
+            # Store for later use
+            fk_relationships.append((fk_col_id, ref_table, ref_col_id))
+    
+    # Add Primary Key (Column-Table) edges
+    for table, pk_cols in primary_keys.items():
+        for pk_col in pk_cols:
+            edges_to_add.append((pk_col, table, 
+                               {'relationship_type': 'pk_table', 
+                                'relationship': f"Primary key of table"}))
+    
+    # Add all edges at once
+    graph.add_edges_from(edges_to_add)
+    
+    conn.close()
+    
+    # Create metadata for efficient access later
+    metadata = {
+        'tables': tables,
+        'primary_keys': primary_keys,
+        'foreign_keys': fk_relationships,
+        'all_columns': all_columns
+    }
+    
+    # Print statistics and timing
+    table_count = len([n for n, d in graph.nodes(data=True) if d.get('type') == 'table'])
+    col_count = len([n for n, d in graph.nodes(data=True) if d.get('type') == 'column'])
+    
+    print(f"Schema graph created in {time.time() - start_time:.2f} seconds with:")
+    print(f" - {table_count} table nodes")
+    print(f" - {col_count} column nodes")
+    print(f" - {graph.number_of_edges()} total edges")
+    
+    # Count edges by relationship type (optional)
+    edge_counts = {}
+    for _, _, data in graph.edges(data=True):
+        rel_type = data.get('relationship_type', 'unknown')
+        edge_counts[rel_type] = edge_counts.get(rel_type, 0) + 1
+    
+    for rel_type, count in edge_counts.items():
+        print(f" - {count} {rel_type} edges")
+    
+    return graph, metadata
+
+
+class OptimizedWeightedFlowPathFinder:
+    """
+    Optimized class for finding relevant paths in a database schema graph
+    using the Weighted Flow Diffusion algorithm.
+    """
+    
+    def __init__(self, gamma=0.02, max_iterations=30):
         """
-        Initialize the query processor.
+        Initialize the optimized weighted flow path finder.
         
         Args:
-            api_url: URL for the LLM API
-            api_key: API key for authentication
-            model: Model name to use
+            gamma: Parameter for Gaussian kernel weighting (default: 0.02)
+            max_iterations: Maximum iterations for flow diffusion (default: 30)
         """
-        self.api_url = api_url
-        self.api_key = api_key
-        self.model = model
-        
-        # Initialize components for each stage of the pipeline
-        self.query_decomposer = QueryDecomposer(api_url, api_key, model)
-        self.path_finder = GraphBasedPathFinder(api_url, api_key, model)
-        self.sql_generator = SQLGenerator(api_url, api_key, model)
+        self.gamma = gamma
+        self.max_iterations = max_iterations
+        self.cache = {}  # For memoization
     
-    def process_query(self, graph, question):
+    def _compute_query_relevance(self, graph, query, use_embeddings=False):
         """
-        Process a natural language query through the pipeline:
-        1. Decompose into subqueries
-        2. Find top 10 relevant paths for each subquery using weighted flow diffusion on the graph
-        3. Generate top 10 SQL for each subquery based on paths with rewards
+        Compute query relevance scores for all nodes using optimized methods.
         
         Args:
-            graph: A graph structure containing nodes and edges
-            question: Natural language question
+            graph: The schema graph
+            query: The query text
+            use_embeddings: Whether to use vector embeddings for similarity
             
         Returns:
-            Dictionary with detailed processing results
+            Dictionary mapping nodes to their query relevance scores
         """
-        # Step 1: Decompose the query into subqueries
-        subqueries = self.query_decomposer.decompose_query(question)
+        # Cache key for memoization
+        cache_key = f"relevance_{hash(query)}"
+        if cache_key in self.cache:
+            return self.cache[cache_key]
         
-        # Step 2 & 3: Process each subquery to find paths and generate SQL
-        subquery_results = []
+        query_terms = set(re.findall(r'\b\w+\b', query.lower()))
+        relevance_scores = {}
         
-        for i, subquery in enumerate(subqueries):
-            # Find top 10 relevant paths for this subquery with relevance scores using weighted flow diffusion
-            path_results = self.path_finder.find_top_relevant_paths(graph, subquery, limit=10)
+        # Optimize by scanning all nodes just once
+        for node_id, attrs in graph.nodes(data=True):
+            node_type = attrs.get('type', '')
             
-            # Extract paths from the graph for SQL generation
-            paths_data = self._extract_paths_from_graph(graph, path_results["paths"])
-            
-            # Generate top 10 SQL for this subquery using the found paths
-            sql_results = self.sql_generator.generate_top_subsqls(paths_data, subquery, path_results["paths"], limit=10)
-            
-            # Combine results for this subquery
-            subquery_results.append({
-                "subquery_id": f"Subquery {chr(65 + i)}",  # A, B, C, etc.
-                "subquery_text": subquery,
-                "top_paths": path_results["paths"],
-                "path_relevance_scores": path_results["relevance_scores"],
-                "top_sqls": sql_results["sqls"],
-                "sql_rewards": sql_results["rewards"]
-            })
-        
-        # Return the processing results
-        return {
-            "original_query": question,
-            "subqueries": subqueries,
-            "subquery_results": subquery_results
-        }
-    
-    def _extract_paths_from_graph(self, graph, relevant_paths):
-        """
-        Convert relevant paths from the graph structure to the format expected by SQLGenerator.
-        
-        Args:
-            graph: The graph structure
-            relevant_paths: List of path identifiers
-            
-        Returns:
-            List of path strings formatted as needed by SQLGenerator
-        """
-        # For the paths that are already in string format, we can use them directly
-        # For paths that are in path ID format, we need to convert them to actual path strings
-        paths_data = []
-        
-        for path in relevant_paths:
-            if isinstance(path, str) and '.' in path:
-                # This is already in the expected format (e.g., "table1.field1.table2.field2")
-                paths_data.append(path)
+            if node_type == 'table':
+                # For table nodes, use table name for relevance
+                node_terms = set(re.findall(r'\b\w+\b', node_id.lower()))
+                relevance = len(query_terms.intersection(node_terms)) * 2  # Give tables higher weight
+                
+            elif node_type == 'column':
+                # For column nodes, use column name
+                table = attrs.get('table', '')
+                column = attrs.get('column_name', '')
+                
+                # Combine both table and column terms
+                node_terms = set(re.findall(r'\b\w+\b', column.lower()))
+                table_terms = set(re.findall(r'\b\w+\b', table.lower()))
+                
+                # Weight column matches higher than table matches for columns
+                col_overlap = len(query_terms.intersection(node_terms)) * 1.5
+                table_overlap = len(query_terms.intersection(table_terms)) * 0.5
+                
+                relevance = col_overlap + table_overlap
             else:
-                # This is a path ID or node sequence we need to convert
-                # This implementation depends on your graph structure
-                if isinstance(path, (list, tuple)):
-                    # If the path is a list of nodes, join them with dots
-                    paths_data.append('.'.join(path))
-                else:
-                    # Try to look up the path in the graph's paths dictionary if it exists
-                    if hasattr(graph, 'paths') and path in graph.paths:
-                        paths_data.append(graph.paths[path])
-                    else:
-                        # Default fallback - use the path ID as is
-                        paths_data.append(str(path))
-        
-        return paths_data
-
-
-class QueryDecomposer:
-    """Component for decomposing a natural language query into subqueries."""
-    
-    def __init__(self, api_url, api_key, model):
-        """Initialize the query decomposer."""
-        self.api_url = api_url
-        self.api_key = api_key
-        self.model = model
-    
-    def decompose_query(self, question):
-        """
-        Decompose a complex query into simpler subqueries.
-        
-        Args:
-            question: The original natural language question
+                relevance = 0
             
-        Returns:
-            List of subqueries
-        """
-        prompt = f"""
-        Please decompose the following complex query into simpler subqueries:
-        
-        QUERY: {question}
-        
-        Break this down into 2-4 distinct subqueries, where each subquery addresses a specific part of the overall question.
-        Format your response as:
-        <SUBQUERIES>
-        1. First subquery text
-        2. Second subquery text
-        ...
-        </SUBQUERIES>
-        """
-        
-        headers = {
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {self.api_key}"
-        }
-        
-        data = {
-            "model": self.model,
-            "messages": [
-                {"role": "system", "content": "You are an expert at breaking down complex queries into simpler components."},
-                {"role": "user", "content": prompt}
-            ],
-            "temperature": 0.3
-        }
-        
-        try:
-            response = requests.post(self.api_url, headers=headers, json=data)
-            response.raise_for_status()
-            response_data = response.json()
+            # Bonus for data type mentions in query
+            if node_type == 'column' and attrs.get('data_type'):
+                data_type = attrs.get('data_type', '').lower()
+                if data_type in query.lower():
+                    relevance += 0.5
             
-            # Extract the generated subqueries from the response
-            content = response_data["choices"][0]["message"]["content"]
-            
-            # Extract subqueries from the tags
-            subqueries_match = re.search(r'<SUBQUERIES>(.*?)</SUBQUERIES>', content, re.DOTALL)
-            
-            if subqueries_match:
-                subqueries_text = subqueries_match.group(1).strip()
-                # Extract numbered items, removing the numbers
-                subquery_list = re.findall(r'^\d+\.\s*(.*?)$', subqueries_text, re.MULTILINE)
+            # Bonus for primary keys as they're often important for joins
+            if attrs.get('is_primary_key', False):
+                relevance += 0.3
                 
-                if subquery_list:
-                    return subquery_list
-            
-            # Fallback: if parsing fails, return the original query as a single subquery
-            return [question]
-                
-        except Exception as e:
-            print(f"Error decomposing query: {e}")
-            # Fallback to a basic decomposition
-            return [question]
-
-
-class GraphBasedPathFinder:
-    """
-    Component for finding relevant paths in a graph using Weighted Flow Diffusion algorithm.
-    Uses both graph structure and node attributes to find local clusters (paths).
-    """
+            relevance_scores[node_id] = relevance
+        
+        # Cache the result
+        self.cache[cache_key] = relevance_scores
+        return relevance_scores
     
-    def __init__(self, api_url=None, api_key=None, model=None):
-        """Initialize the graph-based path finder."""
-        self.api_url = api_url  # Used for attribute extraction if needed
-        self.api_key = api_key  # Used for attribute extraction if needed
-        self.model = model      # Used for attribute extraction if needed
-        self.gamma = 0.02       # Parameter for Gaussian kernel weighting
-        self.max_iterations = 30  # Maximum iterations for flow diffusion
-    
-    def extract_attributes(self, graph, query):
+    def reweight_graph(self, graph, query):
         """
-        Extract attributes for nodes based on semantic similarity to query.
+        Create a weighted version of the graph based on query relevance.
         
         Args:
-            graph: The graph representation
-            query: The query text to compare against
+            graph: The original schema graph
+            query: The query text
             
         Returns:
-            Updated graph with node attributes
+            A weighted graph with edge weights adjusted for query
         """
-        query_terms = set(query.lower().split())
+        # Compute query relevance
+        node_relevance = self._compute_query_relevance(graph, query)
         
-        for node_id, node_data in graph['nodes'].items():
-            # Simple attribute: how many query terms appear in the node name
-            node_terms = set(node_id.lower().split('_'))
-            overlap = len(query_terms.intersection(node_terms))
-            
-            # Store as attribute
-            node_data['query_relevance'] = overlap
+        # Create a weighted copy of the graph
+        weighted_graph = graph.copy()
         
-        return graph
-    
-    def reweight_edges(self, graph):
-        """
-        Reweight edges based on attribute similarity using Gaussian kernel.
-        
-        Args:
-            graph: The graph with node attributes
+        # Reweight all edges in one pass
+        for source, target, data in graph.edges(data=True):
+            rel_type = data.get('relationship_type', '')
             
-        Returns:
-            Updated graph with reweighted edges
-        """
-        # Reweight each edge
-        for i, (source, target, _) in enumerate(graph['edges']):
-            source_attrs = graph['nodes'][source]
-            target_attrs = graph['nodes'][target]
+            # Base weight - start with different weights for different relationship types
+            base_weight = {
+                'pk_fk_column': 2.0,  # Highest priority for foreign key relationships
+                'pk_fk_table': 1.8,   # Table-level foreign key relationships
+                'same_table': 1.5,    # Same table columns
+                'table_column': 1.2,  # Table to column relationships
+                'pk_table': 1.4,      # Primary key to table
+                'fk_table': 1.3       # Foreign key to referenced table
+            }.get(rel_type, 1.0)
             
-            # Calculate attribute distance (based on query_relevance)
+            # Apply Gaussian kernel based on node attribute similarity
+            source_relevance = node_relevance.get(source, 0)
+            target_relevance = node_relevance.get(target, 0)
+            
+            # Compute attribute distance (based on query_relevance)
             # Higher distance = less similar
-            dist = abs(source_attrs.get('query_relevance', 0) - target_attrs.get('query_relevance', 0))
+            dist = abs(source_relevance - target_relevance)
             
-            # Apply Gaussian kernel: weight = exp(-gamma * dist²)
-            weight = math.exp(-self.gamma * (dist ** 2))
+            # Apply Gaussian kernel: weight = base_weight * exp(-gamma * dist²)
+            weight = base_weight * math.exp(-self.gamma * (dist ** 2))
             
-            # Update edge weight
-            graph['edges'][i] = (source, target, weight)
+            # Set the new edge weight
+            weighted_graph[source][target]['weight'] = weight
         
-        return graph
+        return weighted_graph
+    
+    def find_seed_nodes(self, graph, query, limit=3):
+        """
+        Find the best seed nodes to start flow diffusion from.
+        
+        Args:
+            graph: The schema graph
+            query: The query text
+            limit: Maximum number of seed nodes to return
+            
+        Returns:
+            List of (node_id, score) tuples for the best seed nodes
+        """
+        # Compute query relevance if not already cached
+        node_relevance = self._compute_query_relevance(graph, query)
+        
+        # Find highest scoring nodes
+        scored_nodes = [(node, score) for node, score in node_relevance.items() if score > 0]
+        top_nodes = sorted(scored_nodes, key=lambda x: x[1], reverse=True)[:limit]
+        
+        return top_nodes
     
     def flow_diffusion(self, graph, seed_node, alpha=5.0):
         """
         Run the flow diffusion algorithm to find relevant nodes.
         
         Args:
-            graph: The graph representation
+            graph: The weighted graph representation
             seed_node: The starting node for diffusion
             alpha: Source mass multiplier
             
@@ -265,35 +327,34 @@ class GraphBasedPathFinder:
             Dictionary mapping nodes to their importance scores
         """
         # Initialize node embeddings and mass
-        x = {node_id: 0.0 for node_id in graph['nodes']}
-        m = {node_id: 0.0 for node_id in graph['nodes']}
+        nodes = list(graph.nodes())
+        x = {node_id: 0.0 for node_id in nodes}
+        m = {node_id: 0.0 for node_id in nodes}
         
         # Set source mass
         if seed_node in m:
             m[seed_node] = alpha
         else:
-            # If seed node not found, find best match
+            # Find best match if seed node not found
             best_match = None
             best_score = -1
             
-            for node_id in graph['nodes']:
+            for node_id in nodes:
                 if seed_node.lower() in node_id.lower():
-                    relevance = graph['nodes'][node_id].get('query_relevance', 0)
-                    if relevance > best_score:
+                    # Use degree as a proxy for importance if exact match not found
+                    score = graph.degree(node_id)
+                    if score > best_score:
                         best_match = node_id
-                        best_score = relevance
+                        best_score = score
             
             if best_match:
                 m[best_match] = alpha
             else:
-                # Fall back to a node with highest query relevance
-                scores = [(node_id, data.get('query_relevance', 0)) 
-                          for node_id, data in graph['nodes'].items()]
-                best_node = max(scores, key=lambda x: x[1])[0]
-                m[best_node] = alpha
+                # Fall back to the first node if no match
+                m[nodes[0]] = alpha
         
         # Set sink capacities (here using uniform capacity of 1.0)
-        t = {node_id: 1.0 for node_id in graph['nodes']}
+        t = {node_id: 1.0 for node_id in nodes}
         
         # Run flow diffusion for specified iterations
         for _ in range(self.max_iterations):
@@ -304,10 +365,10 @@ class GraphBasedPathFinder:
                 break
                 
             # Pick a random overflow node
-            i = random.choice(overflow_nodes)
+            i = overflow_nodes[0]  # Deterministic for better reproducibility
             
             # Calculate weighted degree
-            w_i = sum(w for s, t, w in graph['edges'] if s == i or t == i)
+            w_i = sum(graph[i][j].get('weight', 1.0) for j in graph.neighbors(i))
             
             if w_i == 0:
                 continue  # Skip isolated nodes
@@ -320,506 +381,499 @@ class GraphBasedPathFinder:
             m[i] = t[i]
             
             # Distribute excess mass to neighbors
-            for j in graph['adjacency'][i]:
+            for j in graph.neighbors(i):
                 # Find edge weight
-                edge_weight = next((w for s, t, w in graph['edges'] 
-                                  if (s == i and t == j) or (s == j and t == i)), 1.0)
+                edge_weight = graph[i][j].get('weight', 1.0)
                 
                 # Update mass at neighbor
                 m[j] += excess * edge_weight / w_i
         
         return x
     
-    def identify_seed_node(self, graph, query):
+    def extract_paths(self, graph, node_importance, metadata, limit=10, max_path_length=4):
         """
-        Identify the best seed node based on query relevance.
+        Extract meaningful paths from the subgraph of important nodes.
         
         Args:
             graph: The graph representation
-            query: The query text
-            
-        Returns:
-            Best seed node
-        """
-        best_node = None
-        best_score = -1
-        
-        for node_id, data in graph['nodes'].items():
-            score = data.get('query_relevance', 0)
-            if score > best_score:
-                best_node = node_id
-                best_score = score
-        
-        return best_node
-    
-    def extract_paths_from_subgraph(self, graph, important_nodes, limit=10):
-        """
-        Extract paths from the subgraph of important nodes identified by flow diffusion.
-        
-        Args:
-            graph: The graph representation
-            important_nodes: Dictionary mapping nodes to importance scores
+            node_importance: Dictionary mapping nodes to importance scores
+            metadata: Database metadata from schema extraction
             limit: Maximum number of paths to return
+            max_path_length: Maximum length of a path
             
         Returns:
-            Dictionary with paths and their relevance scores
+            List of paths (as strings) sorted by relevance
         """
         # Filter nodes with positive importance
-        active_nodes = {node: score for node, score in important_nodes.items() if score > 0}
+        active_nodes = {node: score for node, score in node_importance.items() if score > 0}
         
         if not active_nodes:
-            return {"paths": [], "relevance_scores": {}}
+            return []
         
-        # Find paths by doing a breadth-first search from each important node
-        # This is a simplified approach - you might want to use a more sophisticated path finding algorithm
+        # Sort nodes by importance score
+        sorted_nodes = sorted(active_nodes.items(), key=lambda x: x[1], reverse=True)
+        top_nodes = [node for node, _ in sorted_nodes[:min(10, len(sorted_nodes))]]
+        
         paths = []
         path_scores = {}
         
-        # Sort nodes by importance for prioritization
-        sorted_nodes = sorted(active_nodes.items(), key=lambda x: x[1], reverse=True)
-        
-        # For each important node, find paths to other important nodes
-        for start_node, start_score in sorted_nodes[:min(5, len(sorted_nodes))]:
-            # BFS to find paths
-            queue = [(start_node, [start_node])]
+        # Extract potential table-column-table-column paths
+        for start_node in top_nodes:
+            # Use breadth-first search to find paths
             visited = set([start_node])
+            queue = [(start_node, [start_node], 0)]  # (node, path, length)
             
-            while queue and len(paths) < limit * 2:  # Find more paths than needed, then filter
-                current_node, current_path = queue.pop(0)
+            while queue:
+                current, path, length = queue.pop(0)
                 
-                # If we've reached another important node, record the path
-                if current_node != start_node and current_node in active_nodes:
-                    # Convert path to string format
-                    path_str = '.'.join(current_path)
-                    
-                    # Calculate path score as sum of node importance scores
-                    score = sum(active_nodes.get(node, 0) for node in current_path)
-                    
-                    paths.append(path_str)
-                    path_scores[path_str] = score
+                # If we've reached another important node and path is complete
+                if current != start_node and current in top_nodes and length >= 1:
+                    # Check if the path makes sense (e.g., table->column->table or column->table->column)
+                    if self._is_valid_path(path, graph):
+                        path_str = '.'.join(path)
+                        score = sum(active_nodes.get(node, 0) for node in path)
+                        
+                        paths.append(path_str)
+                        path_scores[path_str] = score
                 
                 # Continue BFS if path is not too long
-                if len(current_path) < 5:  # Limit path length to avoid exponential explosion
-                    for neighbor in graph['adjacency'].get(current_node, []):
+                if length < max_path_length:
+                    for neighbor in graph.neighbors(current):
                         if neighbor not in visited:
-                            visited.add(neighbor)
-                            queue.append((neighbor, current_path + [neighbor]))
+                            # Only continue along edges with enough weight
+                            if graph[current][neighbor].get('weight', 0) > 0.5:
+                                visited.add(neighbor)
+                                queue.append((neighbor, path + [neighbor], length + 1))
         
-        # Sort paths by score and take top limit
+        # Sort paths by score and take top 'limit'
         sorted_paths = sorted(path_scores.items(), key=lambda x: x[1], reverse=True)
         top_paths = sorted_paths[:limit]
         
-        # Normalize scores to [0, 1] range
-        max_score = max([score for _, score in top_paths]) if top_paths else 1.0
-        normalized_scores = {path: score/max_score for path, score in top_paths}
-        
-        # Generate result format
-        paths = [path for path, _ in top_paths]
-        
-        # If fewer than limit paths found, add placeholders
-        if len(paths) < limit:
-            for i in range(len(paths), limit):
-                placeholder = f"path_{i+1}"
-                paths.append(placeholder)
-                normalized_scores[placeholder] = max(0.0, 1.0 - (i * 0.1))
-        
-        return {
-            "paths": paths,
-            "relevance_scores": normalized_scores
-        }
+        # Return just the paths
+        return [path for path, _ in top_paths]
     
-    def find_top_relevant_paths(self, graph, subquery, limit=10, seed_node=None):
+    def _is_valid_path(self, path, graph):
         """
-        Find top relevant paths for a given subquery using weighted flow diffusion.
+        Check if a path is valid for SQL generation.
         
         Args:
-            graph: The graph structure containing nodes and edges
-            subquery: The subquery text
-            limit: Maximum number of paths to return (default: 10)
-            seed_node: Optional seed node to start from
+            path: List of node IDs representing a path
+            graph: The graph
             
         Returns:
-            Dictionary with paths and their relevance scores
+            Boolean indicating if the path is valid
         """
-        try:
-            # Step 1: Extract node attributes based on query relevance
-            graph_with_attributes = self.extract_attributes(graph, subquery)
+        if len(path) < 2:
+            return False
+        
+        # Check alternating pattern of tables and columns
+        node_types = []
+        for node in path:
+            node_type = graph.nodes[node].get('type', '')
+            node_types.append(node_type)
+        
+        # Valid patterns include:
+        # - table -> column -> table -> ...
+        # - column -> table -> column -> ...
+        valid = True
+        for i in range(len(node_types) - 1):
+            if node_types[i] == node_types[i + 1]:
+                # Two tables or two columns in a row need to have a valid relationship
+                if i < len(path) - 1:
+                    rel_type = graph[path[i]][path[i + 1]].get('relationship_type', '')
+                    if rel_type not in ['pk_fk_column', 'pk_fk_table', 'same_table']:
+                        valid = False
+                        break
+        
+        return valid
+    
+    def find_top_relevant_paths(self, graph, metadata, query, limit=10):
+        """
+        Main method to find relevant paths for a query.
+        
+        Args:
+            graph: The schema graph
+            metadata: Database metadata
+            query: The query text
+            limit: Maximum number of paths to return
             
-            # Step 2: Reweight edges based on attribute similarity
-            graph_with_weights = self.reweight_edges(graph_with_attributes)
-            
-            # Step 3: Identify best seed node if not provided
-            if not seed_node:
-                seed_node = self.identify_seed_node(graph_with_weights, subquery)
-            
-            # Step 4: Run flow diffusion from seed node
-            node_importance = self.flow_diffusion(graph_with_weights, seed_node)
-            
-            # Step 5: Extract relevant paths based on node importance
-            result = self.extract_paths_from_subgraph(graph_with_weights, node_importance, limit)
-            
-            return result
-            
-        except Exception as e:
-            print(f"Error in weighted flow diffusion: {e}")
-            # Return placeholders on error
-            placeholders = {}
-            placeholder_paths = []
-            
-            for i in range(limit):
-                path = f"error_path_{i+1}"
-                placeholder_paths.append(path)
-                placeholders[path] = max(0.1, 1.0 - (i * 0.1))
-            
-            return {
-                "paths": placeholder_paths,
-                "relevance_scores": placeholders
-            }
+        Returns:
+            List of relevant paths
+        """
+        # Step 1: Reweight the graph based on query relevance
+        weighted_graph = self.reweight_graph(graph, query)
+        
+        # Step 2: Find the best seed nodes
+        seed_nodes = self.find_seed_nodes(weighted_graph, query)
+        
+        if not seed_nodes:
+            return []
+        
+        # Step 3: Run flow diffusion from the best seed node
+        seed_node, _ = seed_nodes[0]
+        node_importance = self.flow_diffusion(weighted_graph, seed_node)
+        
+        # Step 4: Extract meaningful paths
+        paths = self.extract_paths(weighted_graph, node_importance, metadata, limit)
+        
+        # If we didn't get enough paths, try with other seed nodes
+        if len(paths) < limit and len(seed_nodes) > 1:
+            for seed_node, _ in seed_nodes[1:]:
+                if len(paths) >= limit:
+                    break
+                    
+                # Run diffusion from this seed
+                node_importance = self.flow_diffusion(weighted_graph, seed_node)
+                
+                # Extract more paths
+                additional_paths = self.extract_paths(weighted_graph, node_importance, metadata, 
+                                                     limit=limit-len(paths))
+                
+                # Add unique paths
+                for path in additional_paths:
+                    if path not in paths:
+                        paths.append(path)
+        
+        return paths
 
 
-class SQLGenerator:
-    """Component for generating SQL for subqueries based on relevant paths."""
+class OptimizedSQLGenerator:
+    """
+    Optimized component for generating SQL for subqueries based on relevant paths.
+    """
     
-    def __init__(self, api_url, api_key, model):
-        """Initialize the SQL generator."""
-        self.api_url = api_url
-        self.api_key = api_key
-        self.model = model
-    
-    def generate_top_subsqls(self, paths_data, subquery, relevant_paths, limit=10):
+    def __init__(self, db_schema):
         """
-        Generate top SQL statements for a subquery based on relevant paths and automatically evaluate them.
+        Initialize the SQL generator with database schema information.
         
         Args:
-            paths_data: List of path strings
+            db_schema: Dictionary containing database schema information
+        """
+        self.db_schema = db_schema
+        self.cache = {}
+    
+    def generate_subsqls(self, paths, subquery, limit=5):
+        """
+        Generate SQL statements for a subquery based on relevant paths.
+        
+        Args:
+            paths: List of paths relevant for this subquery
             subquery: The subquery text
-            relevant_paths: List of relevant paths for this subquery
-            limit: Maximum number of SQL statements to generate (default: 10)
+            limit: Maximum number of SQL statements to generate
             
         Returns:
-            Dictionary with generated SQLs and their computed rewards
+            List of SQL statements
         """
-        # Convert paths data and relevant paths to strings for the prompt
-        paths_str = json.dumps(paths_data, indent=2)
-        relevant_paths_str = json.dumps(relevant_paths, indent=2)
+        if not paths:
+            return []
         
-        prompt = f"""
-        Generate {limit} different SQL statements for the following subquery using the given relevant paths.
+        # Structure the paths to help with SQL generation
+        structured_paths = self._structure_paths(paths)
         
-        AVAILABLE PATHS:
-        {paths_str}
+        # Generate SQL candidates for each structured path
+        sql_candidates = []
         
-        RELEVANT PATHS FOR THIS SUBQUERY:
-        {relevant_paths_str}
-        
-        SUBQUERY: {subquery}
-        
-        Generate {limit} different, valid SQL statements that correctly answer this subquery using the provided paths.
-        Each SQL should be complete and executable. Ensure variety in the solutions.
-        
-        Format your response as:
-        <SQL_1>
-        Your first SQL code here
-        </SQL_1>
-        
-        <SQL_2>
-        Your second SQL code here
-        </SQL_2>
-        
-        ... and so on for all {limit} SQL statements
-        """
-        
-        headers = {
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {self.api_key}"
-        }
-        
-        data = {
-            "model": self.model,
-            "messages": [
-                {"role": "system", "content": "You are an expert SQL generator."},
-                {"role": "user", "content": prompt}
-            ],
-            "temperature": 0.5,  # Slightly higher temperature for more variety
-            "max_tokens": 4000
-        }
-        
-        try:
-            response = requests.post(self.api_url, headers=headers, json=data)
-            response.raise_for_status()
-            response_data = response.json()
-            
-            # Extract the generated SQLs from the response
-            content = response_data["choices"][0]["message"]["content"]
-            
-            sqls = []
-            
-            # Extract all SQL statements
-            for i in range(1, limit + 1):
-                # Extract SQL from the tags
-                sql_match = re.search(rf'<SQL_{i}>(.*?)</SQL_{i}>', content, re.DOTALL)
-                if sql_match:
-                    sql = sql_match.group(1).strip()
-                    sqls.append(sql)
-            
-            # If fewer than limit SQLs were generated, add placeholders
-            if len(sqls) < limit:
-                for i in range(len(sqls), limit):
-                    placeholder_sql = f"-- Placeholder SQL #{i+1} for: {subquery}\nSELECT * FROM table WHERE condition_{i+1};"
-                    sqls.append(placeholder_sql)
-            
-            # Now evaluate each SQL statement
-            rewards = self._evaluate_sql_statements(sqls, subquery, paths_data, relevant_paths)
-            
-            return {
-                "sqls": sqls,
-                "rewards": rewards
-            }
+        for struct in structured_paths:
+            table = struct.get('main_table')
+            if not table:
+                continue
                 
-        except Exception as e:
-            print(f"Error generating SQLs: {e}")
-            # Return placeholders on error
-            placeholder_sqls = []
-            placeholder_rewards = {}
+            # Generate a basic SELECT query
+            columns = struct.get('columns', [])
+            joins = struct.get('joins', [])
             
-            for i in range(limit):
-                sql = f"-- Error generating SQL #{i+1} for: {subquery}\nSELECT * FROM error_table WHERE error_condition_{i+1};"
-                placeholder_sqls.append(sql)
+            # Basic SELECT
+            sql = f"SELECT {', '.join(columns)} FROM {table}"
+            
+            # Add JOINs
+            for join in joins:
+                join_table = join.get('table')
+                join_condition = join.get('condition')
+                if join_table and join_condition:
+                    sql += f" JOIN {join_table} ON {join_condition}"
+            
+            # Add a basic WHERE clause based on the subquery
+            where_clause = self._generate_where_clause(subquery, struct)
+            if where_clause:
+                sql += f" WHERE {where_clause}"
                 
-                placeholder_rewards[sql] = {
-                    "exec_correctness": 0.0,  # Cannot execute
-                    "schema_linking": 0.0,
-                    "dialect_function": 0.0,
-                    "query_planning": 0.0,
-                    "efficiency": 0.0,
-                    "divergence": 0.0
-                }
+            sql_candidates.append(sql)
+            
+            # Generate variations with different clauses
+            if limit > 1 and len(sql_candidates) < limit:
+                # Version with GROUP BY if aggregation seems needed
+                if any(word in subquery.lower() for word in ['count', 'sum', 'average', 'group', 'total']):
+                    group_cols = [col for col in columns if not any(agg in col.lower() for agg in ['count(', 'sum(', 'avg('])]
+                    if group_cols:
+                        group_sql = sql + f" GROUP BY {', '.join(group_cols)}"
+                        sql_candidates.append(group_sql)
                 
-            return {
-                "sqls": placeholder_sqls,
-                "rewards": placeholder_rewards
-            }
+                # Version with ORDER BY if sorting seems needed
+                if any(word in subquery.lower() for word in ['order', 'sort', 'highest', 'lowest', 'top', 'bottom']):
+                    order_cols = columns[:1] if columns else []
+                    if order_cols:
+                        direction = "DESC" if any(word in subquery.lower() for word in ['highest', 'top', 'most']) else "ASC"
+                        order_sql = sql + f" ORDER BY {order_cols[0]} {direction}"
+                        sql_candidates.append(order_sql)
+                        
+                # Version with LIMIT if bounds seem needed
+                if any(word in subquery.lower() for word in ['top', 'first', 'limit', 'recent']):
+                    limit_sql = sql + " LIMIT 10"
+                    sql_candidates.append(limit_sql)
+        
+        # Ensure we return at most 'limit' SQL statements
+        return sql_candidates[:limit]
     
-    def _evaluate_sql_statements(self, sql_statements, subquery, paths_data, relevant_paths):
+    def _structure_paths(self, paths):
         """
-        Evaluate SQL statements based on execution and other metrics.
+        Convert raw paths into structured representations for SQL generation.
         
         Args:
-            sql_statements: List of SQL statements to evaluate
-            subquery: The original subquery
-            paths_data: JSON data containing available paths
-            relevant_paths: List of relevant paths for this subquery
+            paths: List of path strings
             
         Returns:
-            Dictionary mapping each SQL statement to its reward metrics
+            List of structured path dictionaries
         """
-        rewards = {}
+        structured = []
         
-        for sql in sql_statements:
-            # Initialize rewards structure
-            sql_rewards = {
-                "exec_correctness": 0.0,
-                "schema_linking": 0.0,
-                "dialect_function": 0.0,
-                "query_planning": 0.0,
-                "efficiency": 0.0,
-                "divergence": 0.0
-            }
-            
-            # Test 1: Check if the SQL is valid syntax
-            try:
-                # Try to parse the SQL using sqlparse
-                parsed = sqlparse.parse(sql)
-                if parsed:
-                    # If it parses successfully, it has at least valid syntax
-                    sql_rewards["exec_correctness"] = 0.5  # Base score for valid syntax
-                else:
-                    sql_rewards["exec_correctness"] = 0.0
-            except Exception:
-                sql_rewards["exec_correctness"] = 0.0
-            
-            # Test 2: Check for correct schema linking
-            sql_rewards["schema_linking"] = self._evaluate_schema_linking(sql, paths_data, relevant_paths)
-            
-            # Test 3: Check for dialect functions
-            sql_rewards["dialect_function"] = self._evaluate_dialect_functions(sql)
-            
-            # Test 4: Evaluate query planning
-            sql_rewards["query_planning"] = self._evaluate_query_planning(sql)
-            
-            # Test 5: Evaluate efficiency
-            sql_rewards["efficiency"] = self._evaluate_efficiency(sql)
-            
-            # Test 6: Evaluate divergence (compare to other generated SQLs)
-            sql_rewards["divergence"] = self._evaluate_divergence(sql, sql_statements)
-            
-            # Store the rewards for this SQL
-            rewards[sql] = sql_rewards
-        
-        return rewards
-    
-    def _evaluate_schema_linking(self, sql, paths_data, relevant_paths):
-        """Evaluate how well the SQL uses proper schema elements from paths"""
-        # Extract tables and columns from SQL
-        tables_pattern = r'FROM\s+([a-zA-Z0-9_]+)'
-        columns_pattern = r'SELECT\s+(.*?)\s+FROM'
-        
-        tables_match = re.search(tables_pattern, sql, re.IGNORECASE)
-        columns_match = re.search(columns_pattern, sql, re.IGNORECASE | re.DOTALL)
-        
-        # If no tables or columns found, give a low score
-        if not tables_match or not columns_match:
-            return 0.1
-        
-        # Check if tables mentioned in SQL appear in the relevant paths
-        tables = tables_match.group(1).split(',')
-        tables = [t.strip() for t in tables]
-        
-        # Check if tables are in the relevant paths
-        table_match_score = 0.0
-        for table in tables:
-            if any(table in path for path in relevant_paths):
-                table_match_score += 1.0
-        
-        if tables:
-            table_match_score /= len(tables)
-        
-        # Extract columns from the SELECT clause
-        columns_text = columns_match.group(1)
-        # Handle wildcard case
-        if '*' in columns_text:
-            column_match_score = 0.5  # Wildcard gets a medium score
-        else:
-            columns = columns_text.split(',')
-            columns = [c.strip() for c in columns]
-            
-            # Check if columns are likely to be correct based on paths
-            column_match_score = 0.0
-            for column in columns:
-                # Remove table prefix if present
-                if '.' in column:
-                    column = column.split('.')[1]
+        for path in paths:
+            elements = path.split('.')
+            if len(elements) < 2:
+                continue
                 
-                # Check if column appears in paths
-                if any(column in path for path in relevant_paths):
-                    column_match_score += 1.0
+            # Determine the main table and columns
+            tables = [elem for elem in elements if '.' not in elem]
+            if not tables:
+                continue
+                
+            main_table = tables[0]
+            columns = []
+            joins = []
             
-            if columns:
-                column_match_score /= len(columns)
-        
-        # Evaluate join conditions
-        join_score = 0.0
-        if 'JOIN' in sql.upper():
-            # Simple heuristic: joins exist and seem to connect relevant tables
-            join_score = 0.8
+            # Extract columns and joins
+            for i, elem in enumerate(elements):
+                if '.' in elem:
+                    # This is a column
+                    table, column = elem.split('.')
+                    columns.append(f"{table}.{column}")
+                    
+                    # If this is a column from a different table, add a join
+                    if table != main_table and table in tables:
+                        # Find a potential join path
+                        for j in range(i):
+                            if elements[j] == table or (j+1 < len(elements) and elements[j+1] == table):
+                                # Found a connection to this table
+                                if '.' in elements[j]:
+                                    join_col = elements[j]
+                                    join_table, join_column = join_col.split('.')
+                                    
+                                    # Add a join if not already present
+                                    if not any(j['table'] == table for j in joins):
+                                        joins.append({
+                                            'table': table,
+                                            'condition': f"{main_table}.{join_column} = {table}.{join_column}"
+                                        })
             
-            # Check for ON conditions which suggest proper joins
-            if 'ON' in sql.upper() and '=' in sql:
-                join_score = 1.0
+            # If no columns were found, use * as a fallback
+            if not columns:
+                columns = [f"{main_table}.*"]
+            
+            structured.append({
+                'main_table': main_table,
+                'columns': columns,
+                'joins': joins
+            })
         
-        # Combine scores, weighted toward tables and joins
-        final_score = (table_match_score * 0.4) + (column_match_score * 0.3) + (join_score * 0.3)
-        return final_score
+        return structured
     
-    def _evaluate_dialect_functions(self, sql):
-        """Evaluate correct usage of dialect-specific functions"""
-        sql_upper = sql.upper()
+    def _generate_where_clause(self, subquery, struct):
+        """
+        Generate a WHERE clause based on the subquery and structure.
         
-        # List of common SQL dialect functions
-        dialect_functions = [
-            'ST_DISTANCE', 'ST_CONTAINS', 'ST_WITHIN',  # Spatial
-            'DATE_TRUNC', 'TO_TIMESTAMP', 'EXTRACT',    # Date/time
-            'REGEXP_MATCHES', 'REGEXP_REPLACE',         # Regex
-            'ARRAY_AGG', 'UNNEST', 'JSON_EXTRACT',      # Arrays/JSON
-            'PERCENTILE_CONT', 'MEDIAN', 'STDDEV',      # Statistical
-            'RANK', 'DENSE_RANK', 'ROW_NUMBER'          # Window functions
-        ]
+        Args:
+            subquery: The subquery text
+            struct: Structured path information
+            
+        Returns:
+            WHERE clause string or empty string
+        """
+        # Simple approach: extract potential filter conditions from the query
+        where_clauses = []
         
-        function_count = 0
-        for func in dialect_functions:
-            if func in sql_upper:
-                function_count += 1
+        # Look for comparison patterns in the subquery
+        comparisons = ['greater than', 'less than', 'equal to', 'more than', 
+                      'at least', 'at most', 'between', 'like']
         
-        # Check for proper syntax around functions
-        syntax_pattern = r'(\w+)\s*\([\w\s,*]+\)'
-        syntax_matches = re.findall(syntax_pattern, sql)
-        syntax_score = min(1.0, len(syntax_matches) * 0.2)  # Scale based on function count
+        # Check for numbers in the query
+        numbers = re.findall(r'\b\d+\b', subquery)
+        date_keywords = ['date', 'year', 'month', 'today', 'yesterday', 'current']
         
-        # If no functions are used, assign a neutral score
-        if function_count == 0:
-            return 0.5
+        columns = struct.get('columns', [])
         
-        # Score based on proper function usage and syntax
-        return min(1.0, 0.3 + (function_count * 0.15) + (syntax_score * 0.55))
-    
-    def _evaluate_query_planning(self, sql):
-        """Evaluate multi-step or nested SQL structures"""
-        # ... [implementation remains the same as in original code] ...
-        sql_upper = sql.upper()
-        
-        # Check for advanced SQL structures
-        has_cte = 'WITH' in sql_upper
-        has_subquery = '(' in sql and 'SELECT' in sql_upper[sql_upper.find('('):] if '(' in sql_upper else False
-        has_union = 'UNION' in sql_upper
-        has_group_by = 'GROUP BY' in sql_upper
-        has_having = 'HAVING' in sql_upper
-        has_order_by = 'ORDER BY' in sql_upper
-        has_limit = 'LIMIT' in sql_upper
-        
-        # Count the structural elements
-        structure_count = sum([has_cte, has_subquery, has_union, has_group_by, has_having, has_order_by, has_limit])
-        
-        # Check for nested subqueries (more complex planning)
-        nesting_level = 0
-        inside_subquery = False
-        for char in sql:
-            if char == '(':
-                if inside_subquery:
-                    nesting_level += 1
-                elif 'SELECT' in sql_upper[sql.find('(') - 10:sql.find('(')]:
-                    inside_subquery = True
-            elif char == ')' and inside_subquery:
-                if nesting_level > 0:
-                    nesting_level -= 1
+        # If we found numbers and have columns
+        if numbers and columns:
+            for number in numbers:
+                # Find potential comparison operators
+                if any(comp in subquery for comp in ['greater', 'more', 'over', 'above', 'exceeds']):
+                    op = '>'
+                elif any(comp in subquery for comp in ['less', 'under', 'below']):
+                    op = '<'
                 else:
-                    inside_subquery = False
+                    op = '='
+                
+                # Select an appropriate column
+                for col in columns:
+                    col_name = col.split('.')[-1] if '.' in col else col
+                    if any(keyword in col_name.lower() for keyword in ['id', 'count', 'num', 'total']):
+                        where_clauses.append(f"{col} {op} {number}")
+                        break
+                else:
+                    # Default to the first column if no suitable column found
+                    if columns:
+                        where_clauses.append(f"{columns[0]} {op} {number}")
         
-        # More complex nesting gets higher scores
-        nesting_score = min(1.0, nesting_level * 0.2)
+        # Check for date filters
+        if any(keyword in subquery.lower() for keyword in date_keywords):
+            for col in columns:
+                col_name = col.split('.')[-1] if '.' in col else col
+                if any(keyword in col_name.lower() for keyword in ['date', 'time', 'year', 'created', 'updated']):
+                    if 'today' in subquery.lower():
+                        where_clauses.append(f"{col} = date('now')")
+                    elif 'yesterday' in subquery.lower():
+                        where_clauses.append(f"{col} = date('now', '-1 day')")
+                    elif 'this month' in subquery.lower():
+                        where_clauses.append(f"strftime('%Y-%m', {col}) = strftime('%Y-%m', 'now')")
+                    elif 'this year' in subquery.lower():
+                        where_clauses.append(f"strftime('%Y', {col}) = strftime('%Y', 'now')")
+                    break
         
-        # Simple scoring based on complexity
-        base_score = 0.3
-        complexity_score = min(0.7, structure_count * 0.1)
+        # Look for named entities (people, products, etc.)
+        name_pattern = r'"([^"]+)"'
+        names = re.findall(name_pattern, subquery)
+        if names:
+            # For each potential name/string value
+            for name in names:
+                # Find a suitable column
+                for col in columns:
+                    col_name = col.split('.')[-1] if '.' in col else col
+                    if any(keyword in col_name.lower() for keyword in ['name', 'title', 'description']):
+                        where_clauses.append(f"{col} LIKE '%{name}%'")
+                        break
         
-        return base_score + complexity_score + nesting_score * 0.3
+        # Combine all clauses with AND
+        if where_clauses:
+            return ' AND '.join(where_clauses)
+        return ''
+
+
+class OptimizedQueryProcessor:
+    """
+    Main class for processing natural language queries using the graph-based approach.
+    """
     
-    def _evaluate_efficiency(self, sql):
-        """Evaluate SQL for efficiency based on static analysis"""
-        sql_upper = sql.upper()
+    def __init__(self, db_file):
+        """
+        Initialize the query processor with a database file.
         
-        # Check for common inefficient patterns
-        has_select_star = 'SELECT *' in sql_upper
-        has_cartesian_join = 'FROM' in sql_upper and 'JOIN' in sql_upper and 'ON' not in sql_upper
-        has_distinct = 'DISTINCT' in sql_upper
-        has_or_conditions = ' OR ' in sql_upper
-        has_not_in = 'NOT IN' in sql_upper
-        has_subquery_in_where = 'WHERE' in sql_upper and '(' in sql_upper and 'SELECT' in sql_upper[sql_upper.find('WHERE'):] 
+        Args:
+            db_file: Path to the SQLite database file
+        """
+        # Create schema graph
+        self.graph, self.metadata = create_schema_graph(db_file)
         
-        # Count potential inefficiencies
-        inefficiencies = sum([has_select_star, has_cartesian_join, has_distinct, has_or_conditions, has_not_in, has_subquery_in_where])
+        # Initialize components
+        self.path_finder = OptimizedWeightedFlowPathFinder()
+        self.sql_generator = OptimizedSQLGenerator(self.metadata)
         
-        # Check for efficiency optimizations
-        has_index_hint = 'INDEX' in sql_upper
-        has_limit = 'LIMIT' in sql_upper
-        has_specific_columns = not has_select_star
-        has_proper_joins = 'JOIN' in sql_upper and 'ON' in sql_upper
+        # Store database file for later use
+        self.db_file = db_file
+    
+    def decompose_query(self, query):
+        """
+        Decompose a complex query into simpler subqueries.
         
-        # Count optimizations
-        optimizations = sum([has_index_hint, has_limit, has_specific_columns, has_proper_joins])
+        Args:
+            query: The original natural language question
+            
+        Returns:
+            List of subqueries
+        """
+        # Check if it's already a simple query
+        word_count = len(query.split())
+        if word_count <= 10:
+            return [query]
         
-        # Calculate efficiency score
-        base_score = 0.5
-        inefficiency_penalty = min(0.5, inefficiencies * 0.1)
-        optimization_bonus = min(0.5, optimizations * 0.125)
+        # Simple rule-based decomposition
+        subqueries = []
         
-        return max(0.0, min(1.0, base_score - inefficiency_penalty + optimization_bonus))
+        # Split on connectors like "and", "or", "as well as"
+        if " and " in query.lower():
+            parts = re.split(r'\band\b', query, flags=re.IGNORECASE)
+            for part in parts:
+                part = part.strip()
+                if part and len(part.split()) >= 3:  # Ensure it's substantial
+                    subqueries.append(part)
+        elif " or " in query.lower():
+            parts = re.split(r'\bor\b', query, flags=re.IGNORECASE)
+            for part in parts:
+                part = part.strip()
+                if part and len(part.split()) >= 3:  # Ensure it's substantial
+                    subqueries.append(part)
+        # Split on question patterns
+        elif "?" in query:
+            parts = query.split("?")
+            for part in parts:
+                part = part.strip()
+                if part and len(part.split()) >= 3:  # Ensure it's substantial
+                    subqueries.append(part + "?")
+        
+        # If no clear decomposition, look for components
+        if not subqueries:
+            # Look for patterns like "Find X that Y"
+            match = re.search(r'\b(find|show|list|get|retrieve)\b(.*?)\b(that|which|where|when)\b(.*)', 
+                             query, re.IGNORECASE)
+            if match:
+                main_part = match.group(1) + match.group(2)
+                condition_part = match.group(3) + match.group(4)
+                subqueries = [main_part.strip(), condition_part.strip()]
+            # Look for various SQL-like components
+            elif any(keyword in query.lower() for keyword in ['order by', 'group by', 'sorted']):
+                # Split query into main part and sorting/grouping part
+                for keyword in ['order by', 'group by', 'sorted by']:
+                    if keyword in query.lower():
+                        parts = re.split(rf'\b{re.escape(keyword)}\b', query, flags=re.IGNORECASE)
+                        if len(parts) == 2:
+                            subqueries = [parts[0].strip(), f"{keyword} {parts[1].strip()}"]
+                            break
+        
+        # If still no decomposition, try to identify main entities and actions
+        if not subqueries:
+            # Identify main entities
+            tables = self.metadata.get('tables', [])
+            entity_matches = []
+            
+            for table in tables:
+                if table.lower() in query.lower():
+                    entity_matches.append(table)
+            
+            # If we found multiple entities, decompose based on them
+            if len(entity_matches) > 1:
+                for entity in entity_matches:
+                    # Find sentences or clauses that mention this entity
+                    pattern = fr"[^.!?]*\b{re.escape(entity)}\b[^.!?]*[.!?]?"
+                    matches = re.findall(pattern, query, re.IGNORECASE)
+                    for match in matches:
+                        if match.strip() and len(match.strip().split()) >= 3:
+                            subqueries.append(match.strip())
+        
+        # If we still couldn't decompose, use the original query
+        if not subqueries:
+            subqueries = [query]
+        
+        # Deduplicate and ensure we don't have too many subqueries
+        subqueries = list(dict.fromkeys(subqueries))  # Remove duplicates while preserving order
+        
+        # Limit to at most 3 subqueries
+        if len(subqueries) > 3:
+            # Keep the most diverse set of subqueries
+            subqueries = subqueries[:3]
