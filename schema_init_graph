@@ -1,216 +1,365 @@
 """
-schema_graph.py - Module for constructing and managing database schema graphs
+schema_graph_builder.py - Module for constructing and manipulating database schema graphs
 """
 
-import sqlite3
+import json
 import networkx as nx
 import time
-import json
-from typing import Dict, List, Tuple, Any
 
-def create_schema_graph(db_file):
+class SchemaGraphBuilder:
     """
-    Extract an optimized schema graph from the database with efficient construction.
-    
-    Args:
-        db_file: Path to the SQLite database file
-        
-    Returns:
-        A tuple of (nx.DiGraph, dict) containing the graph and metadata for later use
+    Class for building and manipulating schema graphs from various sources.
     """
-    start_time = time.time()
     
-    # Create directed graph
-    graph = nx.DiGraph()
-    
-    # Connect to database
-    conn = sqlite3.connect(db_file)
-    cursor = conn.cursor()
-    
-    # Execute a single query to get all tables
-    cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")
-    tables = [table[0] for table in cursor.fetchall()]
-    
-    # Pre-allocate data structures
-    primary_keys = {}
-    foreign_keys = {}
-    all_columns = {}
-    table_column_info = {}
-    
-    # First pass: Get all schema information in batch
-    for table in tables:
-        # Get columns for this table
-        cursor.execute(f"PRAGMA table_info({table});")
-        columns = cursor.fetchall()
-        table_column_info[table] = columns
+    @staticmethod
+    def build_from_paths(paths_json_file):
+        """
+        Build a schema graph from a JSON file containing paths.
         
-        # Get foreign keys for this table
-        cursor.execute(f"PRAGMA foreign_key_list({table});")
-        foreign_keys[table] = cursor.fetchall()
-    
-    # Second pass: Build graph nodes efficiently
-    for table in tables:
-        # Add table node with all attributes at once
-        graph.add_node(table, type='table', node_class='table')
+        Args:
+            paths_json_file: Path to JSON file containing available paths
+            
+        Returns:
+            NetworkX graph representing the schema
+        """
+        print(f"Building schema graph from {paths_json_file}...")
+        start_time = time.time()
         
-        columns = table_column_info[table]
-        primary_keys[table] = []
-        all_columns[table] = []
+        # Load paths data
+        with open(paths_json_file, 'r') as file:
+            paths_data = json.load(file)
         
-        # Add all column nodes for this table at once
-        for col in columns:
-            col_name = col[1]
-            col_id = f"{table}.{col_name}"
-            is_pk = col[5] == 1
-            
-            # Add column node with all attributes
-            graph.add_node(col_id, 
-                          type='column',
-                          node_class='column', 
-                          data_type=col[2],
-                          table=table,
-                          column_name=col_name,
-                          is_primary_key=is_pk,
-                          not_null=col[3]==1)
-            
-            all_columns[table].append(col_id)
-            
-            if is_pk:
-                primary_keys[table].append(col_id)
-    
-    # Third pass: Build all edges efficiently
-    # Pre-compute edge lists for batch addition
-    edges_to_add = []
-    
-    # Add table-column edges
-    for table, columns in all_columns.items():
-        for col_id in columns:
-            edges_to_add.append((table, col_id, {'relationship_type': 'table_column', 
-                                               'relationship': f"Column in {table}"}))
-    
-    # Add same-table edges
-    for table, columns in all_columns.items():
-        for i, col1 in enumerate(columns):
-            for col2 in columns[i+1:]:
-                rel = {'relationship_type': 'same_table', 'relationship': f"Columns in same table ({table})"}
-                edges_to_add.append((col1, col2, rel))
-                edges_to_add.append((col2, col1, rel))
-    
-    # Process foreign keys
-    fk_relationships = []
-    for table, fk_list in foreign_keys.items():
-        for fk in fk_list:
-            fk_col = fk[3]          # Column in current table
-            ref_table = fk[2]       # Referenced table
-            ref_col = fk[4]         # Referenced column
-            
-            fk_col_id = f"{table}.{fk_col}"
-            ref_col_id = f"{ref_table}.{ref_col}"
-            
-            # Primary-Foreign Key (Column-Column)
-            edges_to_add.append((fk_col_id, ref_col_id, 
-                               {'relationship_type': 'pk_fk_column', 
-                                'relationship': f"Foreign key reference"}))
-            
-            # Foreign Key (Column-Table)
-            edges_to_add.append((fk_col_id, ref_table, 
-                               {'relationship_type': 'fk_table', 
-                                'relationship': f"Foreign key to table"}))
-            
-            # Primary-Foreign Key (Table-Table)
-            edges_to_add.append((table, ref_table, 
-                               {'relationship_type': 'pk_fk_table', 
-                                'relationship': f"Table foreign key relationship"}))
-            
-            # Store for later use
-            fk_relationships.append((fk_col_id, ref_table, ref_col_id))
-    
-    # Add Primary Key (Column-Table) edges
-    for table, pk_cols in primary_keys.items():
-        for pk_col in pk_cols:
-            edges_to_add.append((pk_col, table, 
-                               {'relationship_type': 'pk_table', 
-                                'relationship': f"Primary key of table"}))
-    
-    # Add all edges at once
-    graph.add_edges_from(edges_to_add)
-    
-    conn.close()
-    
-    # Extract schema details for LLM
-    schema_details = []
-    for table in tables:
-        columns = []
-        for col in table_column_info[table]:
-            col_info = {
-                "name": col[1],
-                "type": col[2],
-                "is_pk": col[5] == 1,
-                "not_null": col[3] == 1
-            }
-            columns.append(col_info)
+        # Create directed graph
+        graph = nx.DiGraph()
         
-        fks = []
-        for fk in foreign_keys[table]:
-            fk_info = {
-                "column": fk[3],
-                "ref_table": fk[2],
-                "ref_column": fk[4]
-            }
-            fks.append(fk_info)
+        # Process each path to extract nodes and edges
+        for path in paths_data:
+            elements = path.split('.')
+            
+            # Add nodes
+            for i, element in enumerate(elements):
+                if '.' in element:  # This is a column
+                    table, column = element.split('.')
+                    node_id = element
+                    node_type = 'column'
+                    graph.add_node(node_id, type=node_type, table=table, column_name=column)
+                else:  # This is a table
+                    node_id = element
+                    node_type = 'table'
+                    graph.add_node(node_id, type=node_type)
+                
+                # Add edges between consecutive elements
+                if i > 0:
+                    prev_element = elements[i-1]
+                    # Determine relationship type
+                    rel_type = 'table_column'  # Default
+                    
+                    if '.' in prev_element and '.' in element:
+                        rel_type = 'column_column'
+                    elif '.' not in prev_element and '.' not in element:
+                        rel_type = 'table_table'
+                    elif '.' in prev_element and '.' not in element:
+                        rel_type = 'column_table'
+                    
+                    graph.add_edge(prev_element, element, relationship_type=rel_type, weight=1.0)
         
-        table_info = {
-            "table_name": table,
-            "columns": columns,
-            "foreign_keys": fks,
-            "primary_keys": [col[1] for col in table_column_info[table] if col[5] == 1]
+        # Add reverse edges for undirected connectivity
+        edges_to_add = []
+        for u, v, data in graph.edges(data=True):
+            edges_to_add.append((v, u, data.copy()))
+        
+        # Add reverse edges
+        for u, v, data in edges_to_add:
+            if not graph.has_edge(u, v):
+                graph.add_edge(u, v, **data)
+        
+        # Print statistics
+        build_time = time.time() - start_time
+        print(f"Schema graph built in {build_time:.2f} seconds with:")
+        print(f" - {len([n for n, d in graph.nodes(data=True) if d.get('type') == 'table'])} table nodes")
+        print(f" - {len([n for n, d in graph.nodes(data=True) if d.get('type') == 'column'])} column nodes")
+        print(f" - {graph.number_of_edges()} total edges")
+        
+        return graph
+    
+    @staticmethod
+    def build_from_database(db_file):
+        """
+        Build a schema graph by directly querying a database.
+        
+        Args:
+            db_file: Path to SQLite database file
+            
+        Returns:
+            NetworkX graph representing the schema
+        """
+        import sqlite3
+        
+        print(f"Building schema graph from database {db_file}...")
+        start_time = time.time()
+        
+        # Create directed graph
+        graph = nx.DiGraph()
+        
+        # Connect to database
+        conn = sqlite3.connect(db_file)
+        cursor = conn.cursor()
+        
+        # Get list of all tables
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")
+        tables = [table[0] for table in cursor.fetchall()]
+        
+        # Add table nodes and column nodes
+        for table in tables:
+            # Add table node
+            graph.add_node(table, type='table')
+            
+            # Get columns for this table
+            cursor.execute(f"PRAGMA table_info({table});")
+            columns = cursor.fetchall()
+            
+            # Add column nodes and edges from table to columns
+            for col in columns:
+                col_name = col[1]
+                col_id = f"{table}.{col_name}"
+                is_pk = col[5] == 1  # Primary key flag
+                
+                graph.add_node(col_id, 
+                              type='column', 
+                              table=table, 
+                              column_name=col_name,
+                              data_type=col[2],
+                              is_primary_key=is_pk,
+                              not_null=col[3]==1)
+                
+                # Add edge from table to column
+                graph.add_edge(table, col_id, relationship_type='table_column', weight=1.0)
+                # Add reverse edge from column to table
+                graph.add_edge(col_id, table, relationship_type='column_table', weight=1.0)
+        
+        # Add edges between columns in the same table
+        for table in tables:
+            # Get all columns for this table
+            columns = [node for node in graph.nodes() if isinstance(node, str) and node.startswith(f"{table}.")]
+            
+            # Add edges between all columns in the same table
+            for i, col1 in enumerate(columns):
+                for col2 in columns[i+1:]:
+                    graph.add_edge(col1, col2, relationship_type='same_table', weight=1.0)
+                    graph.add_edge(col2, col1, relationship_type='same_table', weight=1.0)
+        
+        # Add foreign key relationships
+        for table in tables:
+            # Get foreign keys for this table
+            cursor.execute(f"PRAGMA foreign_key_list({table});")
+            fk_list = cursor.fetchall()
+            
+            for fk in fk_list:
+                fk_col = fk[3]          # Column in current table
+                ref_table = fk[2]       # Referenced table
+                ref_col = fk[4]         # Referenced column
+                
+                fk_col_id = f"{table}.{fk_col}"
+                ref_col_id = f"{ref_table}.{ref_col}"
+                
+                # Add edge from foreign key column to referenced column
+                if graph.has_node(fk_col_id) and graph.has_node(ref_col_id):
+                    graph.add_edge(fk_col_id, ref_col_id, relationship_type='pk_fk_column', weight=2.0)
+                    graph.add_edge(ref_col_id, fk_col_id, relationship_type='pk_fk_column', weight=2.0)
+                
+                # Add edge between tables
+                graph.add_edge(table, ref_table, relationship_type='pk_fk_table', weight=1.8)
+                graph.add_edge(ref_table, table, relationship_type='pk_fk_table', weight=1.8)
+        
+        conn.close()
+        
+        # Print statistics
+        build_time = time.time() - start_time
+        print(f"Schema graph built in {build_time:.2f} seconds with:")
+        print(f" - {len([n for n, d in graph.nodes(data=True) if d.get('type') == 'table'])} table nodes")
+        print(f" - {len([n for n, d in graph.nodes(data=True) if d.get('type') == 'column'])} column nodes")
+        print(f" - {graph.number_of_edges()} total edges")
+        
+        return graph
+    
+    @staticmethod
+    def enhance_with_llm_semantics(graph, llm_service):
+        """
+        Enhance graph edge weights based on semantic relationships determined by an LLM.
+        
+        Args:
+            graph: NetworkX graph of the database schema
+            llm_service: LLM service for semantic analysis
+            
+        Returns:
+            Updated graph with semantic edge weights
+        """
+        print("Enhancing graph with semantic edge weights...")
+        start_time = time.time()
+        
+        enhanced_graph = llm_service.enhance_edge_semantics(graph.copy(), {})
+        
+        print(f"Graph enhancement completed in {time.time() - start_time:.2f} seconds")
+        return enhanced_graph
+    
+    @staticmethod
+    def extract_schema_details(graph):
+        """
+        Extract structured schema details from the graph for use in prompts.
+        
+        Args:
+            graph: NetworkX graph of the database schema
+            
+        Returns:
+            Dictionary with structured schema information
+        """
+        tables = {}
+        
+        # First, collect all table nodes
+        for node, attrs in graph.nodes(data=True):
+            if attrs.get('type') == 'table':
+                tables[node] = {
+                    'columns': [],
+                    'primary_keys': [],
+                    'foreign_keys': []
+                }
+        
+        # Then collect column information
+        for node, attrs in graph.nodes(data=True):
+            if attrs.get('type') == 'column' and '.' in node:
+                table, column = node.split('.')
+                if table in tables:
+                    # Add column details
+                    column_info = {
+                        'name': column,
+                        'type': attrs.get('data_type', 'unknown'),
+                        'is_pk': attrs.get('is_primary_key', False),
+                        'not_null': attrs.get('not_null', False)
+                    }
+                    tables[table]['columns'].append(column_info)
+                    
+                    # Add to primary keys if applicable
+                    if attrs.get('is_primary_key', False):
+                        tables[table]['primary_keys'].append(column)
+        
+        # Collect foreign key relationships
+        for source, target, attrs in graph.edges(data=True):
+            if attrs.get('relationship_type') == 'pk_fk_column':
+                if '.' in source and '.' in target:
+                    source_table, source_col = source.split('.')
+                    target_table, target_col = target.split('.')
+                    
+                    if source_table in tables:
+                        fk_info = {
+                            'column': source_col,
+                            'ref_table': target_table,
+                            'ref_column': target_col
+                        }
+                        if fk_info not in tables[source_table]['foreign_keys']:
+                            tables[source_table]['foreign_keys'].append(fk_info)
+        
+        # Convert to list format for the schema details
+        schema_details = []
+        for table_name, table_info in tables.items():
+            schema_details.append({
+                'table_name': table_name,
+                'columns': table_info['columns'],
+                'primary_keys': table_info['primary_keys'],
+                'foreign_keys': table_info['foreign_keys']
+            })
+        
+        return schema_details
+    
+    @staticmethod
+    def format_schema_for_prompt(schema_details):
+        """
+        Format schema details for inclusion in LLM prompts.
+        
+        Args:
+            schema_details: List of dictionaries containing schema information
+            
+        Returns:
+            String representation of the schema
+        """
+        schema_text = "DATABASE SCHEMA:\n"
+        
+        for table in schema_details:
+            schema_text += f"Table: {table['table_name']}\n"
+            schema_text += "Columns:\n"
+            
+            for col in table['columns']:
+                pk_marker = " (Primary Key)" if col['is_pk'] else ""
+                null_marker = " NOT NULL" if col['not_null'] else ""
+                schema_text += f"  - {col['name']} ({col['type']}){pk_marker}{null_marker}\n"
+            
+            if table['foreign_keys']:
+                schema_text += "Foreign Keys:\n"
+                for fk in table['foreign_keys']:
+                    schema_text += f"  - {fk['column']} -> {fk['ref_table']}.{fk['ref_column']}\n"
+            
+            schema_text += "\n"
+        
+        return schema_text
+    
+    @staticmethod
+    def save_graph(graph, output_file):
+        """
+        Save the graph to a file for later use.
+        
+        Args:
+            graph: NetworkX graph
+            output_file: Path to output file
+        """
+        # Convert graph to a serializable format
+        serializable_graph = {
+            'nodes': [],
+            'edges': []
         }
-        schema_details.append(table_info)
-    
-    # Create metadata for efficient access
-    metadata = {
-        'tables': tables,
-        'primary_keys': primary_keys,
-        'foreign_keys': fk_relationships,
-        'all_columns': all_columns,
-        'schema_details': schema_details
-    }
-    
-    # Print statistics
-    print(f"Schema graph created in {time.time() - start_time:.2f} seconds with:")
-    print(f" - {len(tables)} table nodes")
-    print(f" - {sum(len(cols) for cols in all_columns.values())} column nodes")
-    print(f" - {graph.number_of_edges()} total edges")
-    
-    return graph, metadata
-
-
-def format_schema_for_prompt(schema_details):
-    """
-    Format schema details for inclusion in LLM prompts.
-    
-    Args:
-        schema_details: List of dictionaries containing schema information
         
-    Returns:
-        String representation of the schema
-    """
-    schema_text = "DATABASE SCHEMA:\n"
+        for node, attrs in graph.nodes(data=True):
+            node_data = {'id': node}
+            node_data.update(attrs)
+            serializable_graph['nodes'].append(node_data)
+        
+        for source, target, attrs in graph.edges(data=True):
+            edge_data = {'source': source, 'target': target}
+            edge_data.update(attrs)
+            serializable_graph['edges'].append(edge_data)
+        
+        # Save to file
+        with open(output_file, 'w') as f:
+            json.dump(serializable_graph, f, indent=2)
+        
+        print(f"Graph saved to {output_file}")
     
-    for table in schema_details:
-        schema_text += f"Table: {table['table_name']}\n"
-        schema_text += "Columns:\n"
+    @staticmethod
+    def load_graph(input_file):
+        """
+        Load a graph from a file.
         
-        for col in table['columns']:
-            pk_marker = " (Primary Key)" if col['is_pk'] else ""
-            null_marker = " NOT NULL" if col['not_null'] else ""
-            schema_text += f"  - {col['name']} ({col['type']}){pk_marker}{null_marker}\n"
+        Args:
+            input_file: Path to input file
+            
+        Returns:
+            NetworkX graph
+        """
+        # Load from file
+        with open(input_file, 'r') as f:
+            serializable_graph = json.load(f)
         
-        if table['foreign_keys']:
-            schema_text += "Foreign Keys:\n"
-            for fk in table['foreign_keys']:
-                schema_text += f"  - {fk['column']} -> {fk['ref_table']}.{fk['ref_column']}\n"
+        # Create new graph
+        graph = nx.DiGraph()
         
-        schema_text += "\n"
-    
-    return schema_text
+        # Add nodes
+        for node_data in serializable_graph['nodes']:
+            node_id = node_data.pop('id')
+            graph.add_node(node_id, **node_data)
+        
+        # Add edges
+        for edge_data in serializable_graph['edges']:
+            source = edge_data.pop('source')
+            target = edge_data.pop('target')
+            graph.add_edge(source, target, **edge_data)
+        
+        print(f"Graph loaded from {input_file}")
+        return graph
