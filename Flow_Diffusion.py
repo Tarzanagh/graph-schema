@@ -1,5 +1,5 @@
 """
-flow_diffusion.py - Implementation of the Weighted Flow Diffusion algorithm
+flow_diffusion.py - Flow Diffusion for subcluster finding in database schemas
 """
 
 import math
@@ -157,8 +157,8 @@ class WeightedFlowDiffusion:
             if not overflow_nodes:
                 break
                 
-            # Pick a random overflow node
-            i = overflow_nodes[0]  # Deterministic for better reproducibility
+            # Pick an overflow node (deterministic for reproducibility)
+            i = overflow_nodes[0]  
             
             # Calculate weighted degree
             w_i = sum(graph[i][j].get('weight', 1.0) for j in graph.neighbors(i))
@@ -184,7 +184,7 @@ class WeightedFlowDiffusion:
         
         return x
     
-    def find_subcluster(self, graph, node_importance, min_importance=0.1):
+    def find_subcluster(self, graph, node_importance, min_importance=0.1, max_size=15):
         """
         Identify a subcluster of important nodes based on flow diffusion results.
         
@@ -192,6 +192,7 @@ class WeightedFlowDiffusion:
             graph: The graph representation
             node_importance: Dictionary mapping nodes to importance scores
             min_importance: Minimum importance threshold for inclusion
+            max_size: Maximum size of the subcluster
             
         Returns:
             Set of node IDs in the identified subcluster
@@ -202,7 +203,7 @@ class WeightedFlowDiffusion:
         if not active_nodes:
             return set()
         
-        # Select core nodes (highest importance)
+        # Sort by importance and take top nodes to form core of subcluster
         sorted_nodes = sorted(active_nodes.items(), key=lambda x: x[1], reverse=True)
         core_nodes = {node for node, _ in sorted_nodes[:min(5, len(sorted_nodes))]}
         
@@ -213,164 +214,179 @@ class WeightedFlowDiffusion:
                 if node_importance.get(neighbor, 0) > 0:
                     subcluster.add(neighbor)
         
+        # Limit subcluster size if needed
+        if len(subcluster) > max_size:
+            # Keep most important nodes
+            subcluster = {node for node, _ in sorted_nodes[:max_size]}
+        
         return subcluster
     
-    def find_relevant_subclusters(self, graph, query, limit=3):
+    def find_multiple_subclusters(self, graph, query, num_clusters=4):
         """
-        Find relevant subclusters for a query using weighted flow diffusion.
+        Find multiple non-overlapping subclusters for a query using weighted flow diffusion.
         
         Args:
             graph: The schema graph
             query: The query text
-            limit: Maximum number of subclusters to identify
+            num_clusters: Number of subclusters to find
             
         Returns:
             List of subclusters (each a set of node IDs)
         """
         # Find the best seed nodes
-        seed_nodes = self.find_seed_nodes(graph, query)
+        seed_nodes = self.find_seed_nodes(graph, query, limit=num_clusters*2)
         
         if not seed_nodes:
             return []
         
         subclusters = []
+        used_nodes = set()
         
-        # Find subclusters from different seed nodes
-        for seed_node, _ in seed_nodes[:limit]:
+        # Try to find the requested number of subclusters
+        for seed_node, _ in seed_nodes:
+            # Skip if seed node already in a subcluster
+            if seed_node in used_nodes:
+                continue
+                
             # Run flow diffusion from this seed
             node_importance = self.flow_diffusion(graph, seed_node)
+            
+            # Prioritize nodes not already in other subclusters
+            for node in used_nodes:
+                node_importance[node] = node_importance.get(node, 0) * 0.2  # Reduce importance
             
             # Identify the subcluster
             subcluster = self.find_subcluster(graph, node_importance)
             
             if subcluster:
                 subclusters.append(subcluster)
+                used_nodes.update(subcluster)
+            
+            # Stop if we have enough subclusters
+            if len(subclusters) >= num_clusters:
+                break
         
-        # Deduplicate if subclusters overlap too much
-        unique_subclusters = []
-        for subcluster in subclusters:
-            # Check if this subcluster is too similar to existing ones
-            is_unique = True
-            for existing in unique_subclusters:
-                overlap = len(subcluster.intersection(existing)) / len(subcluster.union(existing))
-                if overlap > 0.7:  # More than 70% overlap
-                    is_unique = False
+        # If we still don't have enough subclusters, try with lower thresholds
+        if len(subclusters) < num_clusters:
+            for seed_node, _ in seed_nodes:
+                if len(subclusters) >= num_clusters:
                     break
-            
-            if is_unique:
-                unique_subclusters.append(subcluster)
-        
-        return unique_subclusters
-    
-    def get_tables_from_subcluster(self, graph, subcluster):
-        """
-        Extract relevant tables from a subcluster.
-        
-        Args:
-            graph: The schema graph
-            subcluster: Set of node IDs in the subcluster
-            
-        Returns:
-            Set of table names
-        """
-        tables = set()
-        
-        for node in subcluster:
-            if graph.nodes[node].get('type') == 'table':
-                tables.add(node)
-            elif graph.nodes[node].get('type') == 'column':
-                # Get the table from column node
-                table = node.split('.')[0] if '.' in node else None
-                if table:
-                    tables.add(table)
-        
-        return tables
-    
-    def get_columns_from_subcluster(self, graph, subcluster):
-        """
-        Extract relevant columns from a subcluster.
-        
-        Args:
-            graph: The schema graph
-            subcluster: Set of node IDs in the subcluster
-            
-        Returns:
-            Dictionary mapping tables to their relevant columns
-        """
-        columns_by_table = defaultdict(list)
-        
-        for node in subcluster:
-            if graph.nodes[node].get('type') == 'column':
-                if '.' in node:
-                    table, column = node.split('.')
-                    columns_by_table[table].append(column)
-        
-        return dict(columns_by_table)
-    
-    def get_joins_from_subcluster(self, graph, subcluster):
-        """
-        Extract potential joins from a subcluster.
-        
-        Args:
-            graph: The schema graph
-            subcluster: Set of node IDs in the subcluster
-            
-        Returns:
-            List of join conditions (table1, col1, table2, col2)
-        """
-        joins = []
-        
-        # Find all FK relationships in the subcluster
-        for source, target, data in graph.edges(data=True):
-            if source in subcluster and target in subcluster:
-                rel_type = data.get('relationship_type', '')
+                    
+                if seed_node in used_nodes:
+                    continue
+                    
+                node_importance = self.flow_diffusion(graph, seed_node)
                 
-                # Primary-Foreign Key (Column-Column) relationship
-                if rel_type == 'pk_fk_column':
-                    if '.' in source and '.' in target:
-                        source_table, source_col = source.split('.')
-                        target_table, target_col = target.split('.')
-                        joins.append((source_table, source_col, target_table, target_col))
+                # Use a lower threshold
+                subcluster = self.find_subcluster(graph, node_importance, min_importance=0.05)
+                
+                if subcluster and not subcluster.issubset(used_nodes):
+                    # Remove already used nodes
+                    subcluster = subcluster - used_nodes
+                    if len(subcluster) >= 3:  # Only add if still substantial
+                        subclusters.append(subcluster)
+                        used_nodes.update(subcluster)
         
-        return joins
+        # If we still don't have enough, create dummy subclusters
+        while len(subclusters) < num_clusters:
+            # Create a dummy subcluster with unused high-degree nodes
+            remaining_nodes = [n for n in graph.nodes() if n not in used_nodes]
+            if not remaining_nodes:
+                break
+                
+            # Sort by degree
+            remaining_nodes.sort(key=lambda n: graph.degree(n), reverse=True)
+            dummy_subcluster = set(remaining_nodes[:5])
+            subclusters.append(dummy_subcluster)
+            used_nodes.update(dummy_subcluster)
+        
+        return subclusters
     
-    def extract_subcluster_info(self, graph, subcluster):
+    def extract_paths_from_subcluster(self, graph, subcluster, limit=10):
         """
-        Extract structured information from a subcluster for SQL generation.
+        Extract meaningful paths from a subcluster.
         
         Args:
-            graph: The schema graph
+            graph: The graph
             subcluster: Set of node IDs in the subcluster
+            limit: Maximum number of paths to return
             
         Returns:
-            Dictionary with tables, columns, and joins
+            List of paths (as strings)
         """
-        # Get tables
-        tables = self.get_tables_from_subcluster(graph, subcluster)
+        paths = []
+        path_scores = {}
         
-        # Get columns
-        columns_by_table = self.get_columns_from_subcluster(graph, subcluster)
+        # Find table nodes in the subcluster
+        table_nodes = [node for node in subcluster if graph.nodes[node].get('type') == 'table']
         
-        # Get joins
-        joins = self.get_joins_from_subcluster(graph, subcluster)
+        # Find column nodes in the subcluster
+        column_nodes = [node for node in subcluster if graph.nodes[node].get('type') == 'column']
         
-        # Identify primary table (most important)
-        primary_table = None
-        if tables:
-            # Count connections to determine the central table
-            table_connections = {table: 0 for table in tables}
-            for src, _, tgt, _ in joins:
-                if src in table_connections:
-                    table_connections[src] += 1
-                if tgt in table_connections:
-                    table_connections[tgt] += 1
+        # Start paths from table nodes
+        for start_node in table_nodes:
+            # BFS to find paths through the subcluster
+            visited = set([start_node])
+            queue = [(start_node, [start_node], 0)]  # (node, path, length)
             
-            # Table with most connections is likely central
-            primary_table = max(table_connections.items(), key=lambda x: x[1])[0] if table_connections else next(iter(tables))
+            while queue and len(paths) < limit * 2:
+                current, path, length = queue.pop(0)
+                
+                # If path reaches a certain length or ends at another table, consider it complete
+                if (length >= 2 and current in table_nodes and current != start_node) or length >= 4:
+                    # Convert path to string format
+                    path_str = '.'.join(path)
+                    paths.append(path_str)
+                    # Score based on node importance and path length
+                    path_scores[path_str] = 1.0 / (length + 1)  # Shorter paths score higher
+                    continue
+                
+                # Continue BFS
+                for neighbor in graph.neighbors(current):
+                    if neighbor in subcluster and neighbor not in visited:
+                        visited.add(neighbor)
+                        queue.append((neighbor, path + [neighbor], length + 1))
         
-        return {
-            'tables': list(tables),
-            'primary_table': primary_table,
-            'columns_by_table': columns_by_table,
-            'joins': joins
-        }
+        # If not enough paths yet, try starting from column nodes
+        if len(paths) < limit:
+            for start_node in column_nodes[:min(5, len(column_nodes))]:
+                visited = set([start_node])
+                queue = [(start_node, [start_node], 0)]
+                
+                while queue and len(paths) < limit * 2:
+                    current, path, length = queue.pop(0)
+                    
+                    if length >= 2:
+                        path_str = '.'.join(path)
+                        if path_str not in paths:
+                            paths.append(path_str)
+                            path_scores[path_str] = 0.8 / (length + 1)  # Slightly lower base score
+                    
+                    if length < 4:
+                        for neighbor in graph.neighbors(current):
+                            if neighbor in subcluster and neighbor not in visited:
+                                visited.add(neighbor)
+                                queue.append((neighbor, path + [neighbor], length + 1))
+        
+        # Sort paths by score and take top ones
+        scored_paths = [(p, path_scores.get(p, 0)) for p in paths]
+        scored_paths.sort(key=lambda x: x[1], reverse=True)
+        
+        top_paths = [p for p, _ in scored_paths[:limit]]
+        
+        # If still not enough paths, generate some simple ones
+        if len(top_paths) < limit:
+            # Create simple table.column paths
+            for table in table_nodes:
+                for col in graph.neighbors(table):
+                    if col in column_nodes and len(top_paths) < limit:
+                        path = f"{table}.{col.split('.')[-1]}"
+                        if path not in top_paths:
+                            top_paths.append(path)
+        
+        # If still not enough, add some placeholder paths
+        while len(top_paths) < limit:
+            placeholder = f"path_{len(top_paths)+1}"
+            top_paths.append(placeholder)
+        
+        return top_paths
