@@ -1,87 +1,70 @@
-#!/usr/bin/env python
-"""
-main.py - Main script for query processing with subclusters and SQL generation
-"""
+import networkx as nx
+from flow_diffusion import WeightedFlowDiffusion
 
-import os
-import json
-import argparse
-import time
-
-from revised_query_processor import QueryProcessor
-
-def main():
-    """Main function to run the flow diffusion-based query processor."""
-    # Parse command line arguments
-    parser = argparse.ArgumentParser(description='Process queries using Flow Diffusion-based Subcluster Analyzer')
-    parser.add_argument('--config', type=str, help='Path to config file with API credentials')
-    parser.add_argument('--paths', type=str, required=True, help='Path to JSON file containing paths')
-    parser.add_argument('--query', type=str, help='Query to process')
-    parser.add_argument('--output', type=str, help='Path to save results as JSON')
-    args = parser.parse_args()
+def run_flow_diffusion_example(db_file, query):
+    """
+    Run flow diffusion on a database schema
     
-    # Load configuration from JSON file
-    config_file = args.config or "config.json"    
+    Args:
+        db_file: Path to SQLite database file
+        query: Natural language query to analyze
+    """
+    print(f"Analyzing query: {query}")
     
-    # Check if paths file exists
-    paths_json_file = args.paths
-    if not os.path.exists(paths_json_file):
-        print(f"Error: Paths file '{paths_json_file}' not found")
-        return
+    # Step 1: Build the graph from database
+    # You can use the db_graph_builder script we created earlier
+    from db_graph_builder import build_graph_from_database
+    graph = build_graph_from_database(db_file)
     
-    # Initialize the query processor with the configuration
-    processor = QueryProcessor.from_config(config_file)
+    # Step 2: Initialize the flow diffusion algorithm
+    flow_diffusion = WeightedFlowDiffusion(gamma=0.02, max_iterations=30)
     
-    # Process the query
-    query = args.query
-    if not query:
-        query = input("Enter your query: ")
+    # Step 3: Find seed nodes based on the query
+    seed_nodes = flow_diffusion.find_seed_nodes(graph, query, limit=3)
+    print(f"Found {len(seed_nodes)} seed nodes:")
+    for node, score in seed_nodes:
+        print(f"  - {node} (score: {score:.2f})")
+    
+    # Step 4: Run flow diffusion from the best seed node
+    if seed_nodes:
+        best_seed, _ = seed_nodes[0]
+        print(f"\nRunning flow diffusion from seed node: {best_seed}")
+        node_importance = flow_diffusion.flow_diffusion(graph, best_seed)
         
-    print(f"Processing query: {query}")
-    print(f"Using paths from: {paths_json_file}")
-    
-    start_time = time.time()
-    results = processor.process_query(paths_json_file, query)
-    total_time = time.time() - start_time
-    
-    print(f"Total processing time: {total_time:.2f} seconds")
-    
-    # Print summary results
-    print("\n" + "="*80)
-    print(f"QUERY: {results['original_query']}")
-    print("="*80)
-    
-    print("\nSUBQUERIES:")
-    for i, subquery in enumerate(results["subqueries"]):
-        print(f"  {chr(65+i)}. {subquery}")
-    
-    for result in results["subquery_results"]:
-        print("\n" + "-"*80)
-        print(f"SUBQUERY {result['subquery_id']}: {result['subquery_text']}")
-        print(f"Processing time: {result['processing_time']:.2f} seconds")
-        print("-"*80)
+        # Print top important nodes
+        top_nodes = sorted(node_importance.items(), key=lambda x: x[1], reverse=True)[:10]
+        print("\nTop important nodes:")
+        for node, importance in top_nodes:
+            print(f"  - {node} (importance: {importance:.2f})")
         
-        print("\nSUBCLUSTERS:")
-        for subcluster_result in result["subclusters"]:
-            print(f"  {subcluster_result['subcluster_id']} (size: {subcluster_result['subcluster_size']})")
+        # Step 5: Find subclusters
+        subclusters = flow_diffusion.find_multiple_subclusters(graph, query, num_clusters=4)
+        print(f"\nFound {len(subclusters)} subclusters:")
+        
+        for i, subcluster in enumerate(subclusters):
+            print(f"\nSubcluster {i+1} ({len(subcluster)} nodes):")
             
-            print("\n  TOP SQL STATEMENTS:")
-            for i, sql in enumerate(subcluster_result["sqls"][:3]):  # Show top 3 for brevity
-                rewards = subcluster_result["rewards"].get(sql, {})
-                avg_reward = sum(rewards.values()) / len(rewards) if rewards else 0
-                
-                print(f"\n  SQL #{i+1} (Avg Reward: {avg_reward:.2f}):")
-                print(f"  {sql.replace(chr(10), chr(10)+'  ')}")
-                print("\n  Rewards:")
-                for reward_type, score in rewards.items():
-                    print(f"    {reward_type}: {score:.2f}")
-    
-    # Also save results to file
-    if args.output:
-        with open(args.output, 'w') as f:
-            json.dump(results, f, indent=2)
-        print(f"\nResults saved to {args.output}")
-
+            # Print table nodes in this subcluster
+            table_nodes = [node for node in subcluster if graph.nodes[node].get('type') == 'table']
+            print(f"  Tables: {', '.join(table_nodes[:5])}" + 
+                  (f" and {len(table_nodes)-5} more" if len(table_nodes) > 5 else ""))
+            
+            # Step 6: Extract paths from subcluster
+            paths = flow_diffusion.extract_paths_from_subcluster(graph, subcluster)
+            print(f"  Paths:")
+            for j, path in enumerate(paths[:5]):
+                print(f"    - {path}")
+            if len(paths) > 5:
+                print(f"    - ... and {len(paths)-5} more paths")
+    else:
+        print("No seed nodes found for this query.")
 
 if __name__ == "__main__":
-    main()
+    import sys
+    if len(sys.argv) < 3:
+        print("Usage: python run_flow_diffusion.py <database_file> <query>")
+        sys.exit(1)
+        
+    db_file = sys.argv[1]
+    query = sys.argv[2]
+    run_flow_diffusion_example(db_file, query)
