@@ -1,96 +1,87 @@
 #!/usr/bin/env python
 """
-main.py - Main entry point for the database query processor
+main.py - Main script for query processing with subclusters and SQL generation
 """
 
 import os
-import sys
-import time
-import argparse
 import json
-from query_processor import QueryProcessor
+import argparse
+import time
+
+from revised_query_processor import QueryProcessor
 
 def main():
-    """Entry point for processing database queries"""
-    parser = argparse.ArgumentParser(description='Process database queries using LLM and weighted flow diffusion')
-    parser.add_argument('--db', '-d', required=True, help='Path to SQLite database file')
-    parser.add_argument('--query', '-q', help='Natural language query to process')
-    parser.add_argument('--llm-endpoint', '-e', required=True, help='URL endpoint for LLM API')
-    parser.add_argument('--llm-key', '-k', help='API key for LLM (if required)')
-    parser.add_argument('--execute', '-x', action='store_true', help='Execute the generated SQL')
-    parser.add_argument('--output', '-o', help='Output file path for results (JSON format)')
+    """Main function to run the flow diffusion-based query processor."""
+    # Parse command line arguments
+    parser = argparse.ArgumentParser(description='Process queries using Flow Diffusion-based Subcluster Analyzer')
+    parser.add_argument('--config', type=str, help='Path to config file with API credentials')
+    parser.add_argument('--paths', type=str, required=True, help='Path to JSON file containing paths')
+    parser.add_argument('--query', type=str, help='Query to process')
+    parser.add_argument('--output', type=str, help='Path to save results as JSON')
     args = parser.parse_args()
     
-    # Check if database exists
-    if not os.path.exists(args.db):
-        print(f"Error: Database file '{args.db}' not found.")
-        return 1
+    # Load configuration from JSON file
+    config_file = args.config or "config.json"    
     
-    # Initialize the query processor
-    processor = QueryProcessor(
-        db_file=args.db,
-        llm_endpoint=args.llm_endpoint,
-        llm_api_key=args.llm_key
-    )
+    # Check if paths file exists
+    paths_json_file = args.paths
+    if not os.path.exists(paths_json_file):
+        print(f"Error: Paths file '{paths_json_file}' not found")
+        return
     
-    # Get query from command line or prompt user
+    # Initialize the query processor with the configuration
+    processor = QueryProcessor.from_config(config_file)
+    
+    # Process the query
     query = args.query
     if not query:
         query = input("Enter your query: ")
-    
-    # Process the query
-    results = processor.process_query(query)
-    
-    # Print the results
-    print("\n" + "="*50)
-    print(f"Original query: {results['original_query']}")
-    print(f"Decomposed into {len(results['subqueries'])} subqueries")
-    print("="*50)
-    
-    for subquery_result in results['subquery_results']:
-        print(f"\n{subquery_result['subquery_id']}: {subquery_result['subquery_text']}")
-        print(f"Processing time: {subquery_result['processing_time']:.2f} seconds")
         
-        # Print subcluster information
-        print("\nRelevant subclusters identified:")
-        for i, subcluster in enumerate(subquery_result['subclusters']):
-            print(f"  Subcluster {i+1}:")
-            print(f"    Tables: {', '.join(subcluster['tables'][:3])}{'...' if len(subcluster['tables']) > 3 else ''}")
-            print(f"    Primary table: {subcluster['primary_table']}")
+    print(f"Processing query: {query}")
+    print(f"Using paths from: {paths_json_file}")
+    
+    start_time = time.time()
+    results = processor.process_query(paths_json_file, query)
+    total_time = time.time() - start_time
+    
+    print(f"Total processing time: {total_time:.2f} seconds")
+    
+    # Print summary results
+    print("\n" + "="*80)
+    print(f"QUERY: {results['original_query']}")
+    print("="*80)
+    
+    print("\nSUBQUERIES:")
+    for i, subquery in enumerate(results["subqueries"]):
+        print(f"  {chr(65+i)}. {subquery}")
+    
+    for result in results["subquery_results"]:
+        print("\n" + "-"*80)
+        print(f"SUBQUERY {result['subquery_id']}: {result['subquery_text']}")
+        print(f"Processing time: {result['processing_time']:.2f} seconds")
+        print("-"*80)
         
-        # Print SQL
-        if subquery_result['sql_statements']:
-            print("\nGenerated SQL statements:")
-            for i, sql in enumerate(subquery_result['sql_statements']):
-                print(f"\nSQL {i+1}:\n{sql}")
+        print("\nSUBCLUSTERS:")
+        for subcluster_result in result["subclusters"]:
+            print(f"  {subcluster_result['subcluster_id']} (size: {subcluster_result['subcluster_size']})")
+            
+            print("\n  TOP SQL STATEMENTS:")
+            for i, sql in enumerate(subcluster_result["sqls"][:3]):  # Show top 3 for brevity
+                rewards = subcluster_result["rewards"].get(sql, {})
+                avg_reward = sum(rewards.values()) / len(rewards) if rewards else 0
                 
-                # Execute SQL if requested
-                if args.execute:
-                    print("\nExecuting SQL...")
-                    result = processor.execute_sql(sql)
-                    
-                    if "error" in result:
-                        print(f"Error: {result['error']}")
-                    else:
-                        print(f"Results: {len(result['rows'])} rows")
-                        if result['rows']:
-                            print(f"Columns: {', '.join(result['columns'])}")
-                            for j, row in enumerate(result['rows'][:5]):
-                                print(f"Row {j+1}: {row}")
-                            if len(result['rows']) > 5:
-                                print(f"... and {len(result['rows']) - 5} more rows")
-        else:
-            print("\nNo SQL statements generated.")
-        
-        print("\n" + "-"*50)
+                print(f"\n  SQL #{i+1} (Avg Reward: {avg_reward:.2f}):")
+                print(f"  {sql.replace(chr(10), chr(10)+'  ')}")
+                print("\n  Rewards:")
+                for reward_type, score in rewards.items():
+                    print(f"    {reward_type}: {score:.2f}")
     
-    # Save results to file if requested
+    # Also save results to file
     if args.output:
         with open(args.output, 'w') as f:
             json.dump(results, f, indent=2)
         print(f"\nResults saved to {args.output}")
-    
-    return 0
+
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()
