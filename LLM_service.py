@@ -1,81 +1,83 @@
 """
 llm_service.py - Module for interacting with LLM APIs (like Llama)
 """
-
+import os
 import requests
 import re
 import json
-from schema_graph import format_schema_for_prompt
+from typing import List, Dict, Any, Optional
+from init_schema_graph import SchemaGraphBuilder
+from GraphBuild import visualize_schema_graph, visualize_schema_graph_communities
 
 class LLMService:
-    """Service for interacting with LLM APIs (like Llama)."""
+    """Service for interacting with LLM APIs."""
     
-    def __init__(self, api_endpoint, api_key=None):
+    def __init__(self, 
+                 api_url: str, 
+                 api_key: Optional[str] = None, 
+                 model: Optional[str] = None):
         """
         Initialize the LLM service.
         
         Args:
-            api_endpoint: URL for the LLM API
-            api_key: API key for authentication (if needed)
+            api_url (str): The URL of the LLM API
+            api_key (str, optional): API key for authentication
+            model (str, optional): Specific model to use
         """
-        self.api_endpoint = api_endpoint
+        self.api_url = api_url
         self.api_key = api_key
+        self.model = model
+        
+        # Validate critical parameters
+        if not self.api_url:
+            raise ValueError("API URL must be provided")
+        if not self.api_key:
+            raise ValueError("API key must be provided or set in environment variable LLM_API_KEY")
     
-    def call_llm(self, prompt, max_tokens=1000, temperature=0.3):
+    def call_llm(self, 
+                prompt: str, 
+                max_tokens: int = 1000, 
+                temperature: float = 0.3) -> str:
         """
         Make a call to the LLM API.
         
         Args:
-            prompt: The prompt text to send to the LLM
-            max_tokens: Maximum number of tokens to generate
-            temperature: Sampling temperature
+            prompt (str): The prompt text to send to the LLM
+            max_tokens (int): Maximum number of tokens to generate
+            temperature (float): Sampling temperature
             
         Returns:
-            Text response from the LLM
+            str: Text response from the LLM
         """
         try:
-            # Make API call to LLM
+            # Prepare headers
             headers = {
-                "Content-Type": "application/json"
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {self.api_key}"
             }
             
-            if self.api_key:
-                headers["Authorization"] = f"Bearer {self.api_key}"
-            
-            # Adapt for different API formats (OpenAI-style vs. Ollama-style)
-            if "ollama" in self.api_endpoint.lower():
-                payload = {
-                    "model": "llama3",  # Default model, can be configured
-                    "prompt": prompt,
-                    "stream": False,
-                    "options": {
-                        "temperature": temperature,
-                        "num_predict": max_tokens
-                    }
-                }
-                response = requests.post(self.api_endpoint, headers=headers, json=payload, timeout=60)
-                if response.status_code == 200:
-                    return response.json().get("response", "")
-            else:
-                # Assume OpenAI-compatible API
-                payload = {
-                    "prompt": prompt,
-                    "max_tokens": max_tokens,
-                    "temperature": temperature
-                }
-                response = requests.post(self.api_endpoint, headers=headers, json=payload, timeout=60)
-                if response.status_code == 200:
-                    return response.json().get("output", "")
-            
-            # Error handling
+            data = {
+                "model": self.model,
+                "messages": [
+                    {"role": "system", "content": "You are an expert at solving assigned tasks."},
+                    {"role": "user", "content": prompt}
+                ],
+                "temperature": 0.2
+            }
+            response = requests.post(self.api_url, headers=headers, json=data)
             response.raise_for_status()
-            return f"Error: Unexpected response format from LLM API"
-                
-        except Exception as e:
+            response_data = response.json()
+            
+            # Extract the generated subqueries from the response
+            content = response_data["choices"][0]["message"]["content"]
+            return content
+        
+
+            
+        except requests.RequestException as e:
             print(f"Error calling LLM API: {e}")
-            return f"Error: {str(e)}"
-    
-    def decompose_query(self, query, schema_details):
+
+    def decompose_query(self, query, schema_details, nquery):
         """
         Use LLM to decompose a complex query into simpler subqueries.
         
@@ -87,17 +89,17 @@ class LLMService:
             List of subqueries
         """
         # Format the schema details
-        schema_text = format_schema_for_prompt(schema_details)
+        schema_text = SchemaGraphBuilder.format_schema_for_prompt(schema_details)
         
         # Create prompt for LLM
         prompt = f"""
-        Your task is to decompose a complex database query into simpler subqueries.
+        Your task is to decompose a complex user query into simpler user subqueries.
         
         {schema_text}
         
         QUERY: {query}
         
-        Break this down into 2-4 distinct subqueries, where each subquery addresses a specific part of the overall question.
+        Break this down into {nquery} distinct user subqueries, where each subquery addresses a specific part of the overall question.
         Format your response as:
         <SUBQUERIES>
         1. First subquery text
@@ -105,7 +107,7 @@ class LLMService:
         ...
         </SUBQUERIES>
         
-        Only include the subqueries within the tags - no explanations or other text.
+        Only include the user subqueries within the tags - no explanations or other text.
         """
         
         # Call LLM
@@ -136,7 +138,7 @@ class LLMService:
             Updated graph with semantically enhanced edge weights
         """
         enhanced_graph = graph.copy()
-        schema_text = format_schema_for_prompt(metadata['schema_details'])
+        schema_text = SchemaGraphBuilder.format_schema_for_prompt(metadata)
         
         # Get all column pairs connected by edges
         column_pairs = []
@@ -149,6 +151,7 @@ class LLMService:
         batch_size = 10
         for i in range(0, len(column_pairs), batch_size):
             batch = column_pairs[i:i+batch_size]
+            print('batch:', batch)
             
             # Create prompt
             prompt = f"""
@@ -184,6 +187,7 @@ class LLMService:
             """
             
             # Call LLM
+
             llm_response = self.call_llm(prompt, max_tokens=1000, temperature=0.2)
             
             # Parse results
@@ -243,7 +247,7 @@ class LLMService:
             List of SQL statements
         """
         # Format the schema details
-        schema_text = format_schema_for_prompt(schema_details)
+        schema_text = SchemaGraphBuilder.format_schema_for_prompt(schema_details)
         
         # Create prompt for LLM
         prompt = f"""
@@ -289,3 +293,69 @@ class LLMService:
                 sqls.append(sql)
         
         return sqls
+
+
+
+
+def main():
+    
+    # Load configuration from JSON file
+    config_file =  "config.json"    
+    with open(config_file, 'r') as f:
+        config = json.load(f)
+
+    # Required keys in config
+    required_keys = ['api_url', 'api_key']
+    for key in required_keys:
+        if key not in config:
+            raise ValueError(f"Missing required configuration key: {key}")
+    
+    # Initialize LLM service
+    llm_service = LLMService(
+        api_url=config['api_url'], 
+        api_key=config['api_key'],
+        model=config.get('model')  # Optional
+    )
+
+    query = config['query']
+    print('query:', query)
+    
+    # Example LLM call
+    # response = llm_service.call_llm("Write a two-sentence explanation of machine learning")
+    # print(response)
+
+    # load schema graph 
+    graph = SchemaGraphBuilder.load_graph('schema_graph.json')
+    schema_details = SchemaGraphBuilder.extract_schema_details(graph)
+
+    # Decompose the query
+    subqueries = llm_service.decompose_query(query, schema_details, 4) 
+    import pdb; pdb.set_trace()
+
+    # Enhanced graph with semantic similarties 
+    enhanced_graph = llm_service.enhance_edge_semantics(graph, schema_details)
+    SchemaGraphBuilder.save_graph(enhanced_graph, output_file = "enhanced_schema_graph.json")
+    visualize_schema_graph(enhanced_graph)
+    visualize_schema_graph_communities(enhanced_graph)
+    enhanced_schema_details = SchemaGraphBuilder.extract_schema_details(enhanced_graph)
+
+    # Decompose the query with enhanced graph
+    subqueries_enhanced = llm_service.decompose_query(query, enhanced_schema_details, 4) 
+    
+    import pdb; pdb.set_trace()
+
+    #Saving the results
+    json_string = json.dumps(subqueries)
+    with open("subqueries.json", "w") as f:
+        f.write(json_string)
+
+    json_string = json.dumps(subqueries_enhanced)
+    with open("subqueries_enhanced.json", "w") as f:
+        f.write(json_string)
+
+
+
+ 
+
+if __name__ == "__main__":
+    main()
