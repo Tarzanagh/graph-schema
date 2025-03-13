@@ -94,7 +94,7 @@ class WeightedFlowDiffusion:
         self.cache[cache_key] = relevance_scores
         return relevance_scores
     
-    def find_seed_nodes(self, graph, query, limit=3):
+    def find_seed_nodes(self, graph, query, limit=10):
         """
         Find the best seed nodes to start flow diffusion from.
         
@@ -129,7 +129,7 @@ class WeightedFlowDiffusion:
             List of subclusters (each a set of node IDs)
         """
         # Find the best seed nodes
-        seed_nodes = self.find_seed_nodes(graph, query, limit=num_clusters*2)
+        seed_nodes = self.find_seed_nodes(graph, query, limit=10)
         
         if not seed_nodes:
             return []
@@ -543,44 +543,15 @@ def main():
     # Initialize the flow diffusion algorithm
     flow_diffusion = WeightedFlowDiffusion(gamma=0.02, max_iterations=30)
 
-
-    def process_query(query):
-        # Find seed nodes
-        seed_nodes = flow_diffusion.find_seed_nodes(graph, query, limit=3)
-        print(f"Found {len(seed_nodes)} seed nodes:")
-        for node, score in seed_nodes:
-            print(f"  - {node} (score: {score:.2f})")
-
-        # Find subclusters for the query
-        best_seed, _ = seed_nodes[0]
-        print(f"\nRunning flow diffusion from seed node: {best_seed}")
-        node_importance = flow_diffusion.flow_diffusion(graph, best_seed)
-    
-        # Print top important nodes
-        top_nodes = sorted(node_importance.items(), key=lambda x: x[1], reverse=True)[:10]
-        print("\nTop important nodes:")
-        for node, importance in top_nodes:
-            print(f"  - {node} (importance: {importance:.2f})")
-    
-        # Find subclusters
-        subclusters = flow_diffusion.find_multiple_subclusters(graph, query, num_clusters=1)
-        print("subclusters:")
-        print(subclusters)
-        return subclusters
-
-    subclusters = process_query(query)
-    
-    import pdb; pdb.set_trace()
-
+    # Find subclusters
+    subclusters = flow_diffusion.find_multiple_subclusters(graph, query, num_clusters=1)
+    print("subclusters:")
+    print(subclusters)
 
     # Decompose the query
     subqueries = llm_service.decompose_query(query, schema_details,2) 
 
-    for subquery in subqueries:
-        print(f"\nProcessing subquery: {subquery}")
-        subclusters = process_query(subquery)
-        
-        
+
 
 
 if __name__ == "__main__":
