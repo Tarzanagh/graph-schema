@@ -115,22 +115,18 @@ class WeightedFlowDiffusion:
         
         return top_nodes
     
-    
-    def find_multiple_subclusters(self, graph, query, num_clusters=4):
+    def find_multiple_subclusters(self, graph, seed_nodes, num_clusters=4):
         """
-        Find multiple non-overlapping subclusters for a query using weighted flow diffusion.
+        Find multiple non-overlapping subclusters using weighted flow diffusion.
         
         Args:
             graph: The schema graph
-            query: The query text
+            seed_nodes: List of (node_id, score) tuples to use as seed nodes
             num_clusters: Number of subclusters to find
             
         Returns:
             List of subclusters (each a set of node IDs)
         """
-        # Find the best seed nodes
-        seed_nodes = self.find_seed_nodes(graph, query, limit=10)
-        
         if not seed_nodes:
             return []
         
@@ -183,17 +179,14 @@ class WeightedFlowDiffusion:
                         used_nodes.update(subcluster)
         
         # If we still don't have enough, create dummy subclusters
-        while len(subclusters) < num_clusters:
+        if len(subclusters) < num_clusters:
             # Create a dummy subcluster with unused high-degree nodes
             remaining_nodes = [n for n in graph.nodes() if n not in used_nodes]
-            if not remaining_nodes:
-                break
-                
-            # Sort by degree
-            remaining_nodes.sort(key=lambda n: graph.degree(n), reverse=True)
-            dummy_subcluster = set(remaining_nodes[:5])
-            subclusters.append(dummy_subcluster)
-            used_nodes.update(dummy_subcluster)
+            if remaining_nodes:
+                # Sort by degree
+                remaining_nodes.sort(key=lambda n: graph.degree(n), reverse=True)
+                dummy_subcluster = set(remaining_nodes[:5])
+                subclusters.append(dummy_subcluster)
         
         return subclusters
         
@@ -277,7 +270,6 @@ class WeightedFlowDiffusion:
                 m[j] += excess * edge_weight / w_i
         
         return x
-
 
     def extract_paths_from_subcluster(self, graph, subcluster, limit=10, max_path_length=8):
         """
@@ -509,11 +501,10 @@ class WeightedFlowDiffusion:
 main.py - Main script for query processing with subclusters and SQL generation
 """
 
-
 def main():
     """Main function to run the flow diffusion-based query processor."""
     # Load configuration from JSON file
-    config_file =  "config.json"    
+    config_file = "config.json"    
     with open(config_file, 'r') as f:
         config = json.load(f)
 
@@ -530,30 +521,53 @@ def main():
         model=config.get('model')  # Optional
     )
     
-
-    # load schema graph & query
+    # Load schema graph & query
     graph = SchemaGraphBuilder.load_graph('enhanced_schema_graph.json')
     schema_details = SchemaGraphBuilder.extract_schema_details(graph)
     query = config['query']
-    print('query:', query)
-    fig1 = visualize_edge_weights(graph, save_path="edge_weights_heatmap.png")
-    fig3 = visualize_graph_with_edge_weights(graph, save_path="weighted_graph.png")
-
+    print('Query:', query)
+    
+    # Visualize the graph structure
+    visualize_edge_weights(graph, save_path="edge_weights_heatmap.png")
+    visualize_graph_with_edge_weights(graph, save_path="weighted_graph.png")
 
     # Initialize the flow diffusion algorithm
     flow_diffusion = WeightedFlowDiffusion(gamma=0.02, max_iterations=30)
-
-    # Find subclusters
-    subclusters = flow_diffusion.find_multiple_subclusters(graph, query, num_clusters=1)
-    print("subclusters:")
-    print(subclusters)
-
-    # Decompose the query
-    subqueries = llm_service.decompose_query(query, schema_details,2) 
-
-
-
+    
+    # First step: Find seed nodes (now separate from finding subclusters)
+    seed_nodes = flow_diffusion.find_seed_nodes(graph, query, limit=10)
+    print(f"Found {len(seed_nodes)} seed nodes:")
+    for node, score in seed_nodes:
+        print(f"  - {node} (score: {score:.2f})")
+        
+    # Second step: Find subclusters using the seed nodes
+    subclusters = flow_diffusion.find_multiple_subclusters(graph, seed_nodes, num_clusters=1)
+    print("\nSubclusters found:")
+    for i, subcluster in enumerate(subclusters):
+        print(f"Subcluster {i+1} ({len(subcluster)} nodes):")
+        # Print a few representative nodes from each subcluster
+        for node in list(subcluster)[:5]:  # Show first 5 nodes
+            print(f"  - {node}")
+        if len(subcluster) > 5:
+            print(f"  - ... and {len(subcluster)-5} more nodes")
+            
+    # Extract paths from subclusters
+    if subclusters:
+        for i, subcluster in enumerate(subclusters):
+            paths = flow_diffusion.extract_paths_from_subcluster(graph, subcluster)
+            print(f"\nPaths from subcluster {i+1}:")
+            for path in paths:
+                print(f"  - {path}")
+    
+    # Decompose the query (optional step)
+    subqueries = llm_service.decompose_query(query, schema_details, 2)
+    print("\nDecomposed into subqueries:")
+    for i, subquery in enumerate(subqueries):
+        print(f"{i+1}. {subquery}")
+        
+        # Process each subquery separately
+        subquery_seed_nodes = flow_diffusion.find_seed_nodes(graph, subquery, limit=5)
+        print(f"  Top seed node: {subquery_seed_nodes[0][0] if subquery_seed_nodes else 'None'}")
 
 if __name__ == "__main__":
     main()
-
