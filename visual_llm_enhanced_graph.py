@@ -408,3 +408,23 @@ def visualize_enhanced_schema_graph(graph, filename="enhanced_schema_graph.png")
             print(f"Failed to save alternative format: {e2}")
     
     plt.close()
+
+
+
+Traceback (most recent call last):
+  File "/home/davoud/GraphReasoning/LLM_service.py", line 1283, in <module>
+    main()
+  File "/home/davoud/GraphReasoning/LLM_service.py", line 1263, in main
+    visualize_enhanced_schema_graph(enhanced_graph, 'test2.png')
+  File "/home/davoud/GraphReasoning/LLM_service.py", line 1062, in visualize_enhanced_schema_graph
+    pos = nx.spring_layout(graph, k=0.3, iterations=50, seed=42)
+  File "<class 'networkx.utils.decorators.argmap'> compilation 4", line 4, in argmap_spring_layout_1
+  File "/home/davoud/.local/lib/python3.10/site-packages/networkx/drawing/layout.py", line 490, in spring_layout
+    A = nx.to_numpy_array(G, weight=weight)
+  File "<class 'networkx.utils.decorators.argmap'> compilation 8", line 3, in argmap_to_numpy_array_5
+  File "/home/davoud/.local/lib/python3.10/site-packages/networkx/utils/backends.py", line 967, in __call__
+    return self.orig_func(*args, **kwargs)
+  File "/home/davoud/.local/lib/python3.10/site-packages/networkx/convert_matrix.py", line 1116, in to_numpy_array
+    A[i, j] = wts
+ValueError: shape mismatch: value array of shape (824,10) could not be broadcast to indexing result of shape (824,)
+davoud@hyperplane2:~/GraphReasoning$ 
