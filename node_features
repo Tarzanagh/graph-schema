@@ -1,0 +1,335 @@
+def _extract_node_features(self, graph, metadata, db_path='db.sqlite'):
+    """
+    Extract enriched feature vectors for each node in the graph using database statistics
+    and LLM-enhanced semantic information.
+    
+    Args:
+        graph: NetworkX graph
+        metadata: Schema metadata
+        db_path: Path to SQLite database
+        
+    Returns:
+        Dictionary mapping node names to lists of feature vectors
+    """
+    import sqlite3
+    import numpy as np
+    from collections import defaultdict
+    
+    node_features = {}
+    node_stats = {}
+    
+    # Connect to SQLite database to extract statistics
+    try:
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+        
+        # Get table information
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")
+        tables = [row[0] for row in cursor.fetchall()]
+        
+        # Collect statistics for each table and column
+        for table in tables:
+            # Get column information
+            cursor.execute(f"PRAGMA table_info({table});")
+            columns = cursor.fetchall()
+            
+            # Get row count
+            cursor.execute(f"SELECT COUNT(*) FROM {table};")
+            row_count = cursor.fetchone()[0]
+            
+            # Store table statistics
+            node_stats[table] = {
+                'row_count': row_count,
+                'col_count': len(columns),
+                'columns': {}
+            }
+            
+            # Get statistics for each column
+            for col_info in columns:
+                col_id, col_name, data_type, not_null, default_val, is_pk = col_info
+                
+                # Get distinct value count
+                cursor.execute(f"SELECT COUNT(DISTINCT {col_name}) FROM {table};")
+                distinct_count = cursor.fetchone()[0]
+                
+                # Get null count
+                cursor.execute(f"SELECT COUNT(*) FROM {table} WHERE {col_name} IS NULL;")
+                null_count = cursor.fetchone()[0]
+                
+                # Try to get min, max for numeric columns
+                min_val = max_val = avg_val = std_dev = None
+                if data_type.lower() in ('integer', 'real', 'numeric', 'int', 'float'):
+                    try:
+                        cursor.execute(f"SELECT MIN({col_name}), MAX({col_name}), AVG({col_name}) FROM {table};")
+                        min_val, max_val, avg_val = cursor.fetchone()
+                        
+                        # Try to get standard deviation
+                        cursor.execute(f"SELECT AVG(({col_name} - subq.avg_val) * ({col_name} - subq.avg_val)) "
+                                      f"FROM {table}, (SELECT AVG({col_name}) as avg_val FROM {table}) as subq;")
+                        variance = cursor.fetchone()[0]
+                        std_dev = np.sqrt(variance) if variance is not None else None
+                    except:
+                        pass  # Skip if calculation fails
+                
+                # Get average length for text columns
+                avg_length = None
+                if data_type.lower() in ('text', 'varchar', 'char', 'string'):
+                    try:
+                        cursor.execute(f"SELECT AVG(LENGTH({col_name})) FROM {table};")
+                        avg_length = cursor.fetchone()[0]
+                    except:
+                        pass
+                
+                # Store column statistics
+                col_key = f"{table}.{col_name}"
+                node_stats[col_key] = {
+                    'data_type': data_type,
+                    'not_null': bool(not_null),
+                    'is_primary_key': bool(is_pk),
+                    'distinct_count': distinct_count,
+                    'null_count': null_count,
+                    'nullability': null_count / row_count if row_count > 0 else 0,
+                    'cardinality': distinct_count / row_count if row_count > 0 else 0,
+                    'min_value': min_val,
+                    'max_value': max_val,
+                    'avg_value': avg_val,
+                    'std_dev': std_dev,
+                    'avg_length': avg_length,
+                }
+                
+                # Check if column is foreign key
+                cursor.execute(f"""
+                    SELECT m.name AS referenced_table
+                    FROM sqlite_master m
+                    JOIN pragma_foreign_key_list({table}) fk
+                    ON m.name = fk.table
+                    WHERE fk."from" = ?
+                """, (col_name,))
+                foreign_key_info = cursor.fetchone()
+                
+                node_stats[col_key]['is_foreign_key'] = foreign_key_info is not None
+                if foreign_key_info:
+                    node_stats[col_key]['references_table'] = foreign_key_info[0]
+        
+        conn.close()
+    
+    except Exception as e:
+        print(f"Error extracting database statistics: {e}")
+    
+    # Use LLM to enrich node semantics
+    # Group nodes by chunks to avoid too large prompts
+    chunk_size = 15
+    all_nodes = list(graph.nodes())
+    
+    for i in range(0, len(all_nodes), chunk_size):
+        node_chunk = all_nodes[i:i+chunk_size]
+        
+        # Prepare the semantic analysis prompt
+        prompt = f"""
+        I need semantic analysis of database schema elements to create feature vectors.
+        
+        For each table or column listed below, provide semantic features across these dimensions:
+        1. Purpose: What is the likely purpose/role of this element?
+        2. Domain: What business domain concepts does it relate to?
+        3. Relationships: What likely relationships does it have with other elements?
+        4. Data characteristics: What can we infer about the data?
+        5. Importance: How central is this element to the schema?
+        
+        Database elements to analyze:
+        """
+        
+        for node in node_chunk:
+            node_type = graph.nodes[node].get('type', '')
+            if node_type == 'table':
+                stats = node_stats.get(node, {})
+                prompt += f"\nTABLE: {node} (rows: {stats.get('row_count', '?')}, columns: {stats.get('col_count', '?')})"
+            elif node_type == 'column':
+                table = node.split('.')[0] if '.' in node else ''
+                column = node.split('.')[1] if '.' in node else node
+                stats = node_stats.get(node, {})
+                prompt += f"\nCOLUMN: {node} (type: {stats.get('data_type', '?')}, " \
+                          f"pk: {stats.get('is_primary_key', False)}, " \
+                          f"fk: {stats.get('is_foreign_key', False)})"
+        
+        prompt += """
+        
+        Format your response as:
+        <NODE>
+        name: node_name
+        purpose_score: 0-1 (e.g., 0.8 for primary identifier, 0.6 for descriptive field)
+        domain_relevance: 0-1 (e.g., 0.9 for core business concept, 0.3 for auxiliary data)
+        relationship_score: 0-1 (e.g., 0.7 for highly connected, 0.2 for isolated)
+        data_richness: 0-1 (e.g., 0.8 for varied valuable data, 0.4 for simple data)
+        centrality: 0-1 (e.g., 0.9 for schema centerpiece, 0.2 for peripheral)
+        tags: comma-separated list of relevant concepts (e.g., "user, authentication, security")
+        </NODE>
+        """
+        
+        # Call LLM
+        llm_response = self.call_llm(prompt, max_tokens=1500, temperature=0.1)
+        
+        # Parse LLM response
+        node_matches = re.findall(r'<NODE>(.*?)</NODE>', llm_response, re.DOTALL)
+        
+        semantic_features = {}
+        
+        for node_match in node_matches:
+            try:
+                # Extract node name
+                name_match = re.search(r'name:\s*(.*?)$', node_match, re.MULTILINE)
+                if not name_match:
+                    continue
+                    
+                node_name = name_match.group(1).strip()
+                
+                # Find the corresponding graph node
+                matching_node = None
+                for n in node_chunk:
+                    if node_name == n or node_name in n:
+                        matching_node = n
+                        break
+                
+                if not matching_node:
+                    continue
+                
+                # Extract features
+                purpose_score = float(re.search(r'purpose_score:\s*([\d\.]+)', node_match).group(1))
+                domain_relevance = float(re.search(r'domain_relevance:\s*([\d\.]+)', node_match).group(1))
+                relationship_score = float(re.search(r'relationship_score:\s*([\d\.]+)', node_match).group(1))
+                data_richness = float(re.search(r'data_richness:\s*([\d\.]+)', node_match).group(1))
+                centrality = float(re.search(r'centrality:\s*([\d\.]+)', node_match).group(1))
+                
+                tags_match = re.search(r'tags:\s*(.*?)$', node_match, re.MULTILINE)
+                tags = tags_match.group(1).strip() if tags_match else ""
+                
+                semantic_features[matching_node] = {
+                    'purpose_score': purpose_score,
+                    'domain_relevance': domain_relevance,
+                    'relationship_score': relationship_score,
+                    'data_richness': data_richness,
+                    'centrality': centrality,
+                    'tags': tags
+                }
+                
+            except Exception as e:
+                print(f"Error parsing node semantic features: {e}")
+    
+    # Now create feature vectors for each node
+    for node in graph.nodes():
+        node_data = graph.nodes[node]
+        node_type = node_data.get('type', '')
+        node_name = node if '.' not in node else node.split('.')[1]
+        table_name = node.split('.')[0] if '.' in node else ''
+        
+        # Get statistics for this node
+        stats = node_stats.get(node, {})
+        
+        # Get semantic features for this node
+        semantics = semantic_features.get(node, {})
+        
+        # 1. Textual Semantic Features
+        textual_feature = np.zeros(10)
+        textual_feature[0] = len(node_name) / 20  # Normalized length
+        textual_feature[1] = len(node_name.split('_')) / 5  # Number of parts
+        textual_feature[2] = float('id' in node_name.lower())
+        textual_feature[3] = float('name' in node_name.lower())
+        textual_feature[4] = float('date' in node_name.lower())
+        textual_feature[5] = semantics.get('purpose_score', 0.5)
+        textual_feature[6] = semantics.get('domain_relevance', 0.5)
+        textual_feature[7] = float('key' in node_name.lower())
+        textual_feature[8] = float('code' in node_name.lower())
+        textual_feature[9] = float('status' in node_name.lower())
+        
+        # 2. Structural Position Features
+        structural_feature = np.zeros(10)
+        neighbors = list(graph.neighbors(node))
+        structural_feature[0] = len(neighbors) / 20  # Normalized degree
+        structural_feature[1] = graph.degree(node) / 50  # Normalized degree
+        structural_feature[2] = 1.0 if node_type == 'table' else 0.0
+        structural_feature[3] = 1.0 if node_type == 'column' else 0.0
+        structural_feature[4] = sum(1 for n in neighbors if graph.nodes[n].get('type') == 'column') / 20
+        structural_feature[5] = sum(1 for n in neighbors if graph.nodes[n].get('type') == 'table') / 5
+        structural_feature[6] = semantics.get('relationship_score', 0.5)
+        structural_feature[7] = semantics.get('centrality', 0.5)
+        
+        # Calculate connection to primary and foreign keys
+        pk_neighbors = sum(1 for n in neighbors if graph.nodes[n].get('is_primary_key', False))
+        fk_neighbors = sum(1 for n in neighbors if graph.nodes[n].get('is_foreign_key', False))
+        structural_feature[8] = pk_neighbors / max(1, len(neighbors))
+        structural_feature[9] = fk_neighbors / max(1, len(neighbors))
+        
+        # 3. Type and Metadata Features
+        type_feature = np.zeros(10)
+        data_type = stats.get('data_type', '').lower()
+        type_feature[0] = float('int' in data_type or 'number' in data_type)
+        type_feature[1] = float('varchar' in data_type or 'char' in data_type or 'text' in data_type)
+        type_feature[2] = float('date' in data_type or 'time' in data_type)
+        type_feature[3] = float('bool' in data_type)
+        type_feature[4] = float('float' in data_type or 'double' in data_type or 'decimal' in data_type)
+        type_feature[5] = float(stats.get('is_primary_key', False))
+        type_feature[6] = float(stats.get('is_foreign_key', False))
+        type_feature[7] = float(stats.get('not_null', False))
+        type_feature[8] = semantics.get('data_richness', 0.5)
+        
+        # 4. Statistical Features
+        statistical_feature = np.zeros(10)
+        statistical_feature[0] = stats.get('nullability', 0.0)
+        statistical_feature[1] = stats.get('cardinality', 0.0)
+        
+        if node_type == 'column':
+            # Normalize min/max values for numeric columns 
+            min_val = stats.get('min_value')
+            max_val = stats.get('max_value')
+            if min_val is not None and max_val is not None and isinstance(min_val, (int, float)) and isinstance(max_val, (int, float)):
+                range_val = max_val - min_val
+                statistical_feature[2] = min(1.0, range_val / 1000) if range_val > 0 else 0
+            
+            # Normalized avg value
+            avg_val = stats.get('avg_value')
+            if avg_val is not None and isinstance(avg_val, (int, float)):
+                statistical_feature[3] = min(1.0, abs(avg_val) / 1000)
+            
+            # Normalized std dev
+            std_dev = stats.get('std_dev')
+            if std_dev is not None and isinstance(std_dev, (int, float)):
+                statistical_feature[4] = min(1.0, std_dev / 100)
+            
+            # Text length features
+            avg_length = stats.get('avg_length')
+            if avg_length is not None:
+                statistical_feature[5] = min(1.0, avg_length / 50)
+        
+        elif node_type == 'table':
+            # Table statistics
+            row_count = stats.get('row_count', 0)
+            col_count = stats.get('col_count', 0)
+            statistical_feature[2] = min(1.0, row_count / 10000)
+            statistical_feature[3] = min(1.0, col_count / 20)
+        
+        # 5. Domain Knowledge Features
+        domain_feature = np.zeros(10)
+        
+        # Parse tags from LLM
+        tags_str = semantics.get('tags', '')
+        tags = [tag.strip().lower() for tag in tags_str.split(',')]
+        
+        # Common business domains
+        domains = [
+            'user', 'customer', 'order', 'product', 'payment', 
+            'transaction', 'inventory', 'employee', 'account', 'finance'
+        ]
+        
+        # Populate domain feature based on tags and node name
+        for i, domain in enumerate(domains):
+            domain_feature[i] = float(domain in tags or domain in node_name.lower() or domain in table_name.lower())
+        
+        # Store all feature vectors for this node
+        node_features[node] = [
+            textual_feature, 
+            structural_feature,
+            type_feature,
+            statistical_feature,
+            domain_feature
+        ]
+    
+    return node_features
