@@ -234,3 +234,177 @@ def load_and_visualize_graph_simple(json_file="schema_graph.json", output_file=N
         plt.close()
     
     return G  # Return the graph
+
+
+def visualize_enhanced_schema_graph(graph, filename="enhanced_schema_graph.png"):
+    """
+    Visualize the enhanced database schema graph with semantic weights
+    and other enhanced features
+    """
+    import matplotlib.pyplot as plt
+    import networkx as nx
+    import numpy as np
+    
+    plt.figure(figsize=(16, 14))
+    
+    # Create positions using a spring layout with adjusted parameters
+    pos = nx.spring_layout(graph, k=0.3, iterations=50, seed=42)
+    
+    # Identify node types
+    table_nodes = [node for node, attrs in graph.nodes(data=True) if attrs.get('type') == 'table']
+    pk_column_nodes = [node for node, attrs in graph.nodes(data=True) 
+                      if attrs.get('type') == 'column' and attrs.get('is_primary_key', False)]
+    fk_column_nodes = [node for node, attrs in graph.nodes(data=True) 
+                      if attrs.get('type') == 'column' and attrs.get('is_foreign_key', False)]
+    regular_column_nodes = [node for node, attrs in graph.nodes(data=True) 
+                          if attrs.get('type') == 'column' 
+                          and not attrs.get('is_primary_key', False)
+                          and not attrs.get('is_foreign_key', False)]
+    
+    # Draw table nodes (larger, distinctive color)
+    nx.draw_networkx_nodes(graph, pos, 
+                          nodelist=table_nodes,
+                          node_size=2000, 
+                          node_color="lightblue",
+                          edgecolors='black',
+                          alpha=0.8)
+    
+    # Draw primary key column nodes
+    nx.draw_networkx_nodes(graph, pos, 
+                          nodelist=pk_column_nodes,
+                          node_size=800, 
+                          node_color="gold",
+                          edgecolors='black',
+                          alpha=0.7)
+    
+    # Draw foreign key column nodes
+    nx.draw_networkx_nodes(graph, pos, 
+                          nodelist=fk_column_nodes,
+                          node_size=800, 
+                          node_color="lightgreen",
+                          edgecolors='black',
+                          alpha=0.7)
+    
+    # Draw regular column nodes
+    nx.draw_networkx_nodes(graph, pos, 
+                          nodelist=regular_column_nodes,
+                          node_size=800, 
+                          node_color="lightgray",
+                          edgecolors='black',
+                          alpha=0.7)
+    
+    # Group edges by relationship type for better visualization
+    relation_edges = {}
+    
+    # Create edge width mapping based on semantic weights
+    edge_widths = {}
+    max_weight = 1.0
+    min_weight = 0.1
+    
+    for u, v, data in graph.edges(data=True):
+        rel_type = data.get('relationship_type', 'other')
+        
+        # Get edge weight
+        weight = data.get('weight', 1.0)
+        if isinstance(weight, str):
+            try:
+                weight = float(weight)
+            except:
+                weight = 1.0
+        
+        # Track max weight for normalization
+        max_weight = max(max_weight, weight)
+        
+        # Add to relation_edges dictionary
+        if rel_type not in relation_edges:
+            relation_edges[rel_type] = []
+            edge_widths[rel_type] = []
+        
+        relation_edges[rel_type].append((u, v))
+        edge_widths[rel_type].append(weight)
+    
+    # Define colors and styles for each relationship type
+    rel_styles = {
+        'same_table': {'color': 'gray', 'style': 'solid'},
+        'pk_fk_column': {'color': 'red', 'style': 'solid'},
+        'foreign_key': {'color': 'blue', 'style': 'dashed'},
+        'pk_table': {'color': 'green', 'style': 'solid'},
+        'table_column': {'color': 'black', 'style': 'dotted'},
+        'pk_fk_table': {'color': 'purple', 'style': 'solid'},
+        'other': {'color': 'darkgray', 'style': 'solid'}
+    }
+    
+    # Draw edges for each relationship type
+    for rel_type, edges in relation_edges.items():
+        style = rel_styles.get(rel_type, {'color': 'gray', 'style': 'solid'})
+        
+        # Normalize widths based on semantic weights
+        if rel_type in edge_widths and edge_widths[rel_type]:
+            widths = [1.0 + 3.0 * (w / max_weight) for w in edge_widths[rel_type]]
+        else:
+            widths = [1.0] * len(edges)
+        
+        nx.draw_networkx_edges(graph, pos,
+                              edgelist=edges,
+                              width=widths,
+                              edge_color=style['color'],
+                              style=style['style'],
+                              alpha=0.7,
+                              arrows=True,
+                              arrowsize=15)
+    
+    # Add labels with different font sizes based on node type
+    table_labels = {node: node for node in table_nodes}
+    
+    # For column labels, show only column name without table prefix
+    column_labels = {}
+    for node in pk_column_nodes + fk_column_nodes + regular_column_nodes:
+        if '.' in node:
+            column_labels[node] = node.split('.')[-1]  
+        else:
+            column_labels[node] = node
+    
+    nx.draw_networkx_labels(graph, pos, 
+                           labels=table_labels,
+                           font_size=12, 
+                           font_weight='bold')
+    
+    nx.draw_networkx_labels(graph, pos, 
+                           labels=column_labels,
+                           font_size=8)
+    
+    # Create a legend
+    plt.plot([0], [0], 'o', markersize=15, color='lightblue', label='Tables')
+    plt.plot([0], [0], 'o', markersize=10, color='gold', label='Primary Key Columns')
+    plt.plot([0], [0], 'o', markersize=10, color='lightgreen', label='Foreign Key Columns')
+    plt.plot([0], [0], 'o', markersize=10, color='lightgray', label='Regular Columns')
+    
+    # Add legend entries for each relationship type
+    for rel_type, style in rel_styles.items():
+        plt.plot([0], [0], '-', linestyle=style['style'], color=style['color'], 
+                linewidth=2.0, label=rel_type.replace('_', ' '))
+    
+    # Add weight scale reference
+    plt.plot([0], [0], '-', color='black', linewidth=1.0, label='Low Weight')
+    plt.plot([0], [0], '-', color='black', linewidth=4.0, label='High Weight')
+    
+    plt.legend(loc='lower right', fontsize=10)
+    
+    plt.axis("off")
+    plt.title("Enhanced Schema Graph with Semantic Weights", fontsize=16)
+    plt.tight_layout()
+    
+    try:
+        plt.savefig(filename, dpi=300, bbox_inches='tight')
+        print(f"Enhanced schema graph visualization saved to '{filename}'")
+    except Exception as e:
+        print(f"Error saving visualization: {e}")
+        # Try alternative format
+        try:
+            alt_file = filename.rsplit('.', 1)[0] + '.svg'
+            plt.savefig(alt_file, format='svg')
+            print(f"Visualization saved to alternative file: {alt_file}")
+        except Exception as e2:
+            print(f"Failed to save alternative format: {e2}")
+    
+    plt.close()
