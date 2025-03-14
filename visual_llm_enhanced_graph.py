@@ -1,165 +1,121 @@
-def load_and_visualize_graph(json_file="schema_graph.json", output_file=None, show=True):
+def save_graph_visualization(json_file, output_file):
     """
-    Load graph from a JSON file and visualize it.
+    Load graph from JSON and save a basic visualization as PNG or PDF.
     
     Args:
         json_file: Path to the JSON file with graph data
-        output_file: Optional path to save the visualization
-        show: Whether to display the visualization
+        output_file: Path for the output image (should end with .png or .pdf)
     """
     import json
     import networkx as nx
+    import matplotlib
+    # Use a different backend that handles complex objects better
+    matplotlib.use('Agg')
     import matplotlib.pyplot as plt
-    import numpy as np
     
     # Load graph from JSON
-    with open(json_file, 'r') as f:
-        graph_data = json.load(f)
+    try:
+        with open(json_file, 'r') as f:
+            graph_data = json.load(f)
+    except Exception as e:
+        print(f"Error loading JSON file: {e}")
+        return
     
     # Create a new graph
     G = nx.Graph()
     
-    # Add nodes with attributes
+    # Add nodes
     for node_data in graph_data['nodes']:
         node_id = node_data.pop('id')
-        G.add_node(node_id, **node_data)
+        G.add_node(node_id)
     
-    # Add edges with attributes
+    # Add edges
     for edge_data in graph_data['edges']:
-        source = edge_data.pop('source')
-        target = edge_data.pop('target')
-        G.add_edge(source, target, **edge_data)
+        source = edge_data['source']
+        target = edge_data['target']
+        G.add_edge(source, target)
     
-    # Create a figure
-    plt.figure(figsize=(16, 12))
-    
-    # Extract node types for coloring
-    node_colors = []
-    for node in G.nodes():
-        node_type = G.nodes[node].get('type', 'unknown')
-        if node_type == 'table':
-            node_colors.append('skyblue')
-        elif node_type == 'column':
-            if G.nodes[node].get('is_primary_key', False):
-                node_colors.append('gold')
-            elif G.nodes[node].get('is_foreign_key', False):
-                node_colors.append('lightgreen')
-            else:
-                node_colors.append('lightgray')
-        else:
-            node_colors.append('white')
-    
-    # Set node sizes based on importance/degree
-    node_sizes = []
-    for node in G.nodes():
-        size = 300 * (1 + G.degree(node) / 10)
-        node_sizes.append(size)
-    
-    # Create edge weights and colors
-    edge_weights = []
-    edge_colors = []
-    for u, v, data in G.edges(data=True):
-        # Get weight from edge data or default to 1.0
-        weight = data.get('weight', 1.0)
-        if isinstance(weight, str):
-            try:
-                weight = float(weight)
-            except:
-                weight = 1.0
-        edge_weights.append(weight * 2)  # Scale for visibility
-        
-        # Set color based on relationship type
-        rel_type = data.get('relationship_type', '')
-        if rel_type == 'foreign_key':
-            edge_colors.append('green')
-        elif rel_type == 'table_column':
-            edge_colors.append('blue')
-        elif 'diffused_weight' in data:
-            edge_colors.append('red')
-        else:
-            edge_colors.append('gray')
+    # Create a new figure with a very simple setup
+    plt.figure(figsize=(16, 12), dpi=100)
+    plt.title("Schema Graph")
     
     # Generate layout
-    try:
-        # Try spring layout first
-        pos = nx.spring_layout(G, k=0.5, iterations=50, seed=42)
-    except:
-        try:
-            # Fall back to kamada_kawai
-            pos = nx.kamada_kawai_layout(G)
-        except:
-            # Last resort: circular layout
-            pos = nx.circular_layout(G)
+    pos = nx.spring_layout(G, seed=42)
     
-    # Draw nodes
-    nx.draw_networkx_nodes(
-        G, pos, 
-        node_size=node_sizes,
-        node_color=node_colors,
-        alpha=0.8,
-        edgecolors='black',
-        linewidths=0.5
-    )
+    # Basic drawing with minimal styling
+    nx.draw(G, pos, 
+            node_size=200, 
+            node_color='lightblue',
+            with_labels=True, 
+            font_size=8)
     
-    # Draw edges
-    nx.draw_networkx_edges(
-        G, pos, 
-        width=edge_weights,
-        edge_color=edge_colors,
-        alpha=0.6,
-        arrows=False
-    )
-    
-    # Create node labels
-    node_labels = {}
-    for node in G.nodes():
-        # Shorten long node names
-        if '.' in node:
-            table, col = node.split('.')
-            node_labels[node] = f"{table[:5]}...{col}" if len(table) > 5 else node
-        else:
-            node_labels[node] = node if len(node) <= 10 else node[:7] + "..."
-    
-    # Draw labels
-    nx.draw_networkx_labels(
-        G, pos,
-        labels=node_labels,
-        font_size=8,
-        font_family='sans-serif'
-    )
-    
-    # Add a title
-    plt.title("Schema Graph Visualization", fontsize=16)
-    
-    # Add a legend
-    table_patch = plt.Line2D([0], [0], marker='o', color='w', markerfacecolor='skyblue', markersize=15, label='Table')
-    column_patch = plt.Line2D([0], [0], marker='o', color='w', markerfacecolor='lightgray', markersize=15, label='Column')
-    pk_patch = plt.Line2D([0], [0], marker='o', color='w', markerfacecolor='gold', markersize=15, label='Primary Key')
-    fk_patch = plt.Line2D([0], [0], marker='o', color='w', markerfacecolor='lightgreen', markersize=15, label='Foreign Key')
-    
-    fk_edge = plt.Line2D([0], [0], color='green', linewidth=3, label='Foreign Key Relationship')
-    table_col_edge = plt.Line2D([0], [0], color='blue', linewidth=3, label='Table-Column Relationship')
-    diffused_edge = plt.Line2D([0], [0], color='red', linewidth=3, label='Diffused Connection')
-    other_edge = plt.Line2D([0], [0], color='gray', linewidth=3, label='Other Relationship')
-    
-    plt.legend(handles=[table_patch, column_patch, pk_patch, fk_patch, 
-                      fk_edge, table_col_edge, diffused_edge, other_edge], 
-             loc='best', fontsize=10)
-    
+    # Turn off axes
     plt.axis('off')
-    plt.tight_layout()
     
-    # Save if output file is provided
-    if output_file:
-        plt.savefig(output_file, dpi=300, bbox_inches='tight')
-    
-    # Show if requested
-    if show:
-        plt.show()
-    else:
-        plt.close()
-    
-    return G  # Return the graph in case it's needed for further analysis
+    # Save the figure
+    try:
+        plt.savefig(output_file, format=output_file.split('.')[-1])
+        print(f"Graph visualization saved to {output_file}")
+    except Exception as e:
+        print(f"Error saving visualization: {e}")
+        
+    # Close the figure to free memory
+    plt.close()
 
-# Example usage:
-# load_and_visualize_graph("enhanced_schema_graph.json", "visualization.png")
+# Usage:
+# save_graph_visualization("schema_graph.json", "graph.png")
+# or
+# save_graph_visualization("schema_graph.json", "graph.pdf")
+#
+def save_graph_with_graphviz(json_file, output_file):
+    """
+    Save graph visualization using PyGraphviz for more reliable output.
+    
+    Args:
+        json_file: Path to JSON file with graph data
+        output_file: Path for output image (png or pdf)
+    """
+    import json
+    import networkx as nx
+    
+    # Load graph data
+    with open(json_file, 'r') as f:
+        graph_data = json.load(f)
+    
+    # Create graph
+    G = nx.Graph()
+    
+    # Add nodes and edges
+    for node_data in graph_data['nodes']:
+        node_id = node_data.pop('id')
+        G.add_node(node_id)
+    
+    for edge_data in graph_data['edges']:
+        source = edge_data['source']
+        target = edge_data['target']
+        G.add_edge(source, target)
+    
+    # Convert to PyGraphviz format
+    try:
+        A = nx.nx_agraph.to_agraph(G)
+        
+        # Set graph attributes
+        A.graph_attr.update(size="12,9", ratio="fill", overlap="false", splines="true")
+        A.node_attr.update(shape="ellipse", style="filled", fillcolor="lightblue")
+        
+        # Save to file
+        A.draw(output_file, prog="fdp")  # fdp is a force-directed layout algorithm
+        print(f"Graph visualization saved to {output_file}")
+    except Exception as e:
+        print(f"Error saving with PyGraphviz: {e}")
+        print("Make sure PyGraphviz and Graphviz are installed:")
+        print("pip install pygraphviz")
+        print("On Ubuntu: apt-get install graphviz libgraphviz-dev")
+        print("On macOS: brew install graphviz")
+        print("On Windows: Download from https://graphviz.org/download/")
+
+# Usage:
+# save_graph_with_graphviz("schema_graph.json", "graph.png")
+# or
+# save_graph_with_graphviz("schema_graph.json", "graph.pdf")
+
