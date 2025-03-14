@@ -44,6 +44,19 @@ def _extract_node_features(self, graph, metadata, db_path='db.sqlite'):
                 'columns': {}
             }
             
+            # Check for foreign keys in this table
+            cursor.execute(f"PRAGMA foreign_key_list({table});")
+            foreign_keys = cursor.fetchall()
+            
+            # Create mapping of column name to referenced table/column
+            fk_mapping = {}
+            for fk in foreign_keys:
+                # Format varies by SQLite version, but typically:
+                # (id, seq, table, from, to, on_update, on_delete, match)
+                if len(fk) >= 5:  # Ensure we have enough elements
+                    fk_id, seq, ref_table, from_col, to_col = fk[0:5]
+                    fk_mapping[from_col] = (ref_table, to_col)
+            
             # Get statistics for each column
             for col_info in columns:
                 col_id, col_name, data_type, not_null, default_val, is_pk = col_info
@@ -80,12 +93,18 @@ def _extract_node_features(self, graph, metadata, db_path='db.sqlite'):
                     except:
                         pass
                 
+                # Check if column is a foreign key
+                is_foreign_key = col_name in fk_mapping
+                referenced_table = fk_mapping.get(col_name, (None, None))[0] if is_foreign_key else None
+                
                 # Store column statistics
                 col_key = f"{table}.{col_name}"
                 node_stats[col_key] = {
                     'data_type': data_type,
                     'not_null': bool(not_null),
                     'is_primary_key': bool(is_pk),
+                    'is_foreign_key': is_foreign_key,
+                    'references_table': referenced_table,
                     'distinct_count': distinct_count,
                     'null_count': null_count,
                     'nullability': null_count / row_count if row_count > 0 else 0,
@@ -96,25 +115,14 @@ def _extract_node_features(self, graph, metadata, db_path='db.sqlite'):
                     'std_dev': std_dev,
                     'avg_length': avg_length,
                 }
-                
-                # Check if column is foreign key
-                cursor.execute(f"""
-                    SELECT m.name AS referenced_table
-                    FROM sqlite_master m
-                    JOIN pragma_foreign_key_list({table}) fk
-                    ON m.name = fk.table
-                    WHERE fk."from" = ?
-                """, (col_name,))
-                foreign_key_info = cursor.fetchone()
-                
-                node_stats[col_key]['is_foreign_key'] = foreign_key_info is not None
-                if foreign_key_info:
-                    node_stats[col_key]['references_table'] = foreign_key_info[0]
         
         conn.close()
     
     except Exception as e:
         print(f"Error extracting database statistics: {e}")
+    
+    # Rest of the function remains the same...
+    # (LLM semantic analysis and feature vector creation)
     
     # Use LLM to enrich node semantics
     # Group nodes by chunks to avoid too large prompts
@@ -227,6 +235,7 @@ def _extract_node_features(self, graph, metadata, db_path='db.sqlite'):
         # Get semantic features for this node
         semantics = semantic_features.get(node, {})
         
+        # Create feature vectors as before...
         # 1. Textual Semantic Features
         textual_feature = np.zeros(10)
         textual_feature[0] = len(node_name) / 20  # Normalized length
