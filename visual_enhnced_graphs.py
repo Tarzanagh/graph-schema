@@ -365,3 +365,12 @@ def visualize_semantic_weight_graph(graph, filename="semantic_weight_graph.png")
         print(f"Error saving visualization: {e}")
     
     plt.close()
+
+
+# # After enhancing your graph
+# enhanced_graph = llm_service.enhance_edge_semantics(graph, metadata, use_diffusion=True)
+
+# # Visualize the graph in three different ways
+# visualize_node_similarity_graph(enhanced_graph, "node_similarity_graph.png")
+# visualize_edge_similarity_graph(enhanced_graph, "edge_similarity_graph.png")
+# visualize_semantic_weight_graph(enhanced_graph, "semantic_weight_graph.png")
