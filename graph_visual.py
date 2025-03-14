@@ -251,3 +251,101 @@ def visualize_graph_communities(graph, output_file=None, show=True):
         plt.show()
     else:
         plt.close()
+
+
+
+
+
+def visualize_schema_graph(graph, filename="database_schema_graph.png"):
+    """Visualize the database schema graph with both tables and columns"""
+
+    plt.figure(figsize=(16, 14))
+    
+    # Create positions using a hierarchical layout
+    pos = nx.spring_layout(graph, k=0.3, iterations=50)
+    
+    # Identify node types
+    table_nodes = [node for node, attrs in graph.nodes(data=True) if attrs.get('type') == 'table']
+    column_nodes = [node for node, attrs in graph.nodes(data=True) if attrs.get('type') == 'column']
+    
+    # Draw table nodes (larger, distinctive color)
+    nx.draw_networkx_nodes(graph, pos, 
+                          nodelist=table_nodes,
+                          node_size=2000, 
+                          node_color="lightblue",
+                          edgecolors='black',
+                          alpha=0.8)
+    
+    # Draw column nodes (smaller, different color)
+    nx.draw_networkx_nodes(graph, pos, 
+                          nodelist=column_nodes,
+                          node_size=800, 
+                          node_color="lightgreen",
+                          edgecolors='black',
+                          alpha=0.7)
+    
+    # Draw edges with different colors based on relationship type
+    edge_colors = []
+    edge_styles = []
+    
+    # Group edges by relationship type for better visualization
+    relation_edges = {}
+    for u, v, data in graph.edges(data=True):
+        rel_type = data.get('relationship_type', 'other')
+        if rel_type not in relation_edges:
+            relation_edges[rel_type] = []
+        relation_edges[rel_type].append((u, v))
+    
+    # Define colors and styles for each relationship type
+    rel_styles = {
+        'same_table': {'color': 'gray', 'style': 'solid', 'width': 0.8},
+        'pk_fk_column': {'color': 'red', 'style': 'solid', 'width': 1.5},
+        'fk_table': {'color': 'blue', 'style': 'dashed', 'width': 1.2},
+        'pk_table': {'color': 'green', 'style': 'solid', 'width': 1.2},
+        'table_column': {'color': 'black', 'style': 'dotted', 'width': 0.8},
+        'pk_fk_table': {'color': 'purple', 'style': 'solid', 'width': 2.0}
+    }
+    
+    # Draw edges for each relationship type
+    for rel_type, edges in relation_edges.items():
+        style = rel_styles.get(rel_type, {'color': 'gray', 'style': 'solid', 'width': 1.0})
+        nx.draw_networkx_edges(graph, pos,
+                              edgelist=edges,
+                              width=style['width'],
+                              edge_color=style['color'],
+                              style=style['style'],
+                              alpha=0.7,
+                              arrows=True,
+                              arrowsize=15)
+    
+    # Add labels with different font sizes based on node type
+    table_labels = {node: node for node in table_nodes}
+    column_labels = {node: node.split('.')[-1] for node in column_nodes}  # Show only column name without table prefix
+    
+    nx.draw_networkx_labels(graph, pos, 
+                           labels=table_labels,
+                           font_size=12, 
+                           font_weight='bold')
+    
+    nx.draw_networkx_labels(graph, pos, 
+                           labels=column_labels,
+                           font_size=8)
+    
+    # Create a legend
+    # Create a legend
+    plt.plot([0], [0], 'o', markersize=15, color='lightblue', label='Tables')
+    plt.plot([0], [0], 'o', markersize=10, color='lightgreen', label='Columns')
+
+    # Add legend entries for each relationship type
+    for rel_type, style in rel_styles.items():
+        plt.plot([0], [0], '-', linestyle=style['style'], color=style['color'], 
+                linewidth=style['width']*1.5, label=rel_type.replace('_', '-'))
+
+    plt.legend(loc='lower right', fontsize=10)
+    
+    plt.axis("off")
+    plt.tight_layout()
+    plt.savefig(filename, dpi=300)
+    print(f"Schema graph visualization saved to '{filename}'")
+    plt.close()
+
